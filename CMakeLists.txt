@@ -41,9 +41,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raylib)
 
+# --- nlohmann/json (header-only, for Tanks.json runtime config) -------------------
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # --- the game ------------------------------------------------------------------
 add_executable(tankshooter tankshooter.cpp)
-target_link_libraries(tankshooter PRIVATE raylib)
+target_link_libraries(tankshooter PRIVATE raylib nlohmann_json::nlohmann_json)
 
 # Drop the binary at the build-tree root so it is easy to find.
 set_target_properties(tankshooter PROPERTIES

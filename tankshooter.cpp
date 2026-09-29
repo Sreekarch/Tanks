@@ -1,18 +1,58 @@
-// tankshooter.cpp — v0.1 prototype
+// tankshooter.cpp — v0.2 prototype
 //
 // Cover-based tank shooter: drivable player tank, broken-down village arena,
-// gunner (first-person) and drone (free-fly) camera modes.
+// gunner (first-person) and drone (free-fly) camera modes, shooting with
+// destructible cover.
 //
 // Controls:
 //   W/S drive, A/D turn hull, mouse aims turret (gunner) / looks (drone),
-//   TAB toggles drone <-> gunner, Q/E drone down/up, ESC quits.
+//   Left-click or Space fires (gunner), TAB toggles drone <-> gunner,
+//   Q/E drone down/up, ESC quits.
 
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
 
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+
+// ---------------------------------------------------------------------------
+// Runtime config (Tanks.json)
+// ---------------------------------------------------------------------------
+struct Config {
+    float shellSpeed       = 70.0f;
+    float shellCooldown    = 1.5f;
+    float shellLifetime    = 4.0f;
+    float shellRadius      = 0.18f;
+    int   buildingHits     = 3;
+    float collapseDuration = 1.6f;
+};
+
+// Loads Tanks.json from the working directory. Missing file or bad values
+// fall back to the defaults above, so the game always runs.
+static Config LoadConfig() {
+    Config c;
+    std::ifstream f("Tanks.json");
+    if (!f) return c;
+    try {
+        nlohmann::json j;
+        f >> j;
+        auto shell    = j.value("shell", nlohmann::json::object());
+        auto building = j.value("building", nlohmann::json::object());
+        auto collapse = j.value("collapse", nlohmann::json::object());
+        c.shellSpeed       = shell.value("speed", c.shellSpeed);
+        c.shellCooldown    = shell.value("cooldownSeconds", c.shellCooldown);
+        c.shellLifetime    = shell.value("lifetimeSeconds", c.shellLifetime);
+        c.shellRadius      = shell.value("radius", c.shellRadius);
+        c.buildingHits     = building.value("hitsToDestroy", c.buildingHits);
+        c.collapseDuration = collapse.value("durationSeconds", c.collapseDuration);
+    } catch (...) { /* keep defaults */ }
+    return c;
+}
 
 // ---------------------------------------------------------------------------
 // World constants
@@ -35,15 +75,63 @@ static float NormalizeAngle(float a) {
 // ---------------------------------------------------------------------------
 // Village
 // ---------------------------------------------------------------------------
+struct HitMark {
+    Vector3 pos;     // point of impact on the building surface
+    Vector3 normal;  // outward face normal (for orienting the scorch)
+    float seed;      // randomizes the blast splotch pattern
+};
+
 struct Building {
     Vector3 center;   // center of the box
     Vector3 size;     // full extents
     Color   color;
+    int   hp = 3;         // hits remaining before collapse
+    int   maxHp = 3;
+    bool  destroyed = false;
+    float collapseT = 0.0f;   // 0..1 collapse animation progress
+    Vector3 fallAxis = { 1.0f, 0.0f, 0.0f };  // random horizontal tip-over axis
+    std::vector<HitMark> marks;  // persistent scorch marks from shell hits
 };
+
+static Vector3 HitFaceNormal(const Vector3 &p, const Building &b) {
+    // The AABB face with the least penetration is the one the shell struck.
+    float px = b.size.x * 0.5f - fabsf(p.x - b.center.x);
+    float py = b.size.y * 0.5f - fabsf(p.y - b.center.y);
+    float pz = b.size.z * 0.5f - fabsf(p.z - b.center.z);
+    if (px < py && px < pz) return Vector3{ (p.x > b.center.x) ? 1.0f : -1.0f, 0.0f, 0.0f };
+    if (py < pz)            return Vector3{ 0.0f, (p.y > b.center.y) ? 1.0f : -1.0f, 0.0f };
+    return Vector3{ 0.0f, 0.0f, (p.z > b.center.z) ? 1.0f : -1.0f };
+}
+
+static void DrawHitMark(const HitMark &m) {
+    // Irregular blast damage: a soft central scorch plus satellite craters
+    // at seeded offsets — reads as an explosion, not a bullseye.
+    Vector3 axis; float angle;
+    if (fabsf(m.normal.x) > 0.5f)      { axis = Vector3{ 0, 1, 0 }; angle = 90.0f * m.normal.x; }
+    else if (fabsf(m.normal.y) > 0.5f) { axis = Vector3{ 1, 0, 0 }; angle = -90.0f * m.normal.y; }
+    else                               { axis = Vector3{ 0, 1, 0 }; angle = (m.normal.z > 0) ? 0.0f : 180.0f; }
+    // Two in-plane axes for scattering splotches across the wall face.
+    Vector3 u, v;
+    if (fabsf(m.normal.x) > 0.5f)      { u = Vector3{ 0, 1, 0 }; v = Vector3{ 0, 0, 1 }; }
+    else if (fabsf(m.normal.y) > 0.5f) { u = Vector3{ 1, 0, 0 }; v = Vector3{ 0, 0, 1 }; }
+    else                               { u = Vector3{ 1, 0, 0 }; v = Vector3{ 0, 1, 0 }; }
+
+    Vector3 c = Vector3Add(m.pos, Vector3Scale(m.normal, 0.07f));
+    DrawCircle3D(c, 0.7f, axis, angle, Color{ 48, 38, 30, 225 });
+    float s = m.seed * 6.2831f;
+    for (int i = 0; i < 3; ++i) {
+        float a = s + i * 2.094f;
+        float r = 0.5f + 0.25f * sinf(s * 3.0f + (float)i * 1.7f);
+        Vector3 sc = Vector3Add(c, Vector3Add(Vector3Scale(u, cosf(a) * r),
+                                              Vector3Scale(v, sinf(a) * r)));
+        DrawCircle3D(sc, 0.3f, axis, angle, Color{ 22, 17, 13, 225 });
+    }
+    DrawCircle3D(c, 0.26f, axis, angle, Color{ 10, 8, 6, 255 });
+}
 
 // Deterministic broken-down village: a street grid with buildings of random
 // height, some ruined (half height), plus rubble piles and broken walls.
-static std::vector<Building> BuildVillage() {
+static std::vector<Building> BuildVillage(int hitsToDestroy) {
     std::vector<Building> out;
     SetRandomSeed(1337);
 
@@ -98,23 +186,60 @@ static std::vector<Building> BuildVillage() {
             out.push_back(Building{ Vector3{ ARENA_HALF, h * 0.5f, x }, Vector3{ 3.0f, h, 20.0f }, Color{ 110, 100, 90, 255 } });
     }
 
+    for (auto &b : out) b.hp = b.maxHp = hitsToDestroy;
     return out;
 }
 
 static void DrawVillage(const std::vector<Building> &village) {
     for (const Building &b : village) {
-        DrawCube(b.center, b.size.x, b.size.y, b.size.z, b.color);
+        if (b.destroyed) {
+            if (b.collapseT < 1.0f) {
+                // Collapse animation: tip over around a random horizontal axis
+                // while sinking. Pivots at the ground so it reads as toppling.
+                float t = b.collapseT;
+                rlPushMatrix();
+                rlTranslatef(b.center.x, 0.0f, b.center.z);
+                rlRotatef(t * 68.0f, b.fallAxis.x, 0.0f, b.fallAxis.z);
+                rlTranslatef(0.0f, b.center.y - t * b.size.y * 0.75f, 0.0f);
+                DrawCube(Vector3{ 0, 0, 0 }, b.size.x, b.size.y, b.size.z,
+                         Color{ 90, 82, 74, 255 });
+                rlPopMatrix();
+            } else {
+                // Settled rubble: three low chunks where the building stood.
+                // Non-blocking (tank can drive over), purely visual cover.
+                float rx = b.size.x * 0.5f, rz = b.size.z * 0.5f;
+                DrawCube(Vector3{ b.center.x - rx * 0.3f, 0.6f, b.center.z + rz * 0.2f },
+                         rx * 0.9f, 1.2f, rz * 0.8f, Color{ 95, 88, 80, 255 });
+                DrawCube(Vector3{ b.center.x + rx * 0.35f, 0.45f, b.center.z - rz * 0.25f },
+                         rx * 0.7f, 0.9f, rz * 0.7f, Color{ 100, 92, 84, 255 });
+                DrawCube(Vector3{ b.center.x + rx * 0.05f, 0.9f, b.center.z + rz * 0.05f },
+                         rx * 0.5f, 1.8f, rz * 0.5f, Color{ 90, 82, 74, 255 });
+            }
+            continue;
+        }
+        // Damage tint: darkens as HP drops, so hits read visually.
+        float f = 0.55f + 0.45f * ((float)b.hp / (float)b.maxHp);
+        Color c = Color{ (unsigned char)(b.color.r * f), (unsigned char)(b.color.g * f),
+                         (unsigned char)(b.color.b * f), 255 };
+        DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
         DrawCubeWires(b.center, b.size.x, b.size.y, b.size.z, Color{ 0, 0, 0, 60 });
         // Darker "roof" cap so buildings read as 3D from the drone.
         DrawCube(Vector3{ b.center.x, b.size.y + 0.05f, b.center.z },
                  b.size.x * 0.98f, 0.1f, b.size.z * 0.98f,
                  Color{ 70, 62, 55, 255 });
+        // Persistent scorch marks where shells struck.
+        rlDisableBackfaceCulling();
+        for (const auto &m : b.marks) DrawHitMark(m);
+        rlDrawRenderBatchActive();
+        rlEnableBackfaceCulling();
     }
 }
 
 // Push a circle (tank) out of every building AABB it overlaps, XZ plane.
+// Destroyed buildings (settled rubble) no longer block.
 static void ResolveBuildingCollisions(Vector3 &pos, const std::vector<Building> &village) {
     for (const Building &b : village) {
+        if (b.destroyed) continue;
         float hx = b.size.x * 0.5f, hz = b.size.z * 0.5f;
         float dx = pos.x - b.center.x;
         float dz = pos.z - b.center.z;
@@ -220,10 +345,14 @@ static void DrawTank(const Tank &t, bool gunnerView) {
     }
     // Turret (rotates relative to hull)
     rlRotatef(-t.turretAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    // Barrel sits forward of the turret ring and below the gunner camera's
-    // sight line, so the in-turret camera looks over it instead of into its
-    // breech — the gun stays visible, glued under the crosshair.
-    DrawCube(Vector3{ 0, 1.5f, -2.3f }, 0.3f, 0.3f, 2.0f, Color{ 50, 52, 48, 255 }); // barrel
+    // Barrel: a cylinder laid along -Z (forward), breech at the turret wall.
+    // DrawCylinder's position is its base, so after rotating -90 deg about X
+    // the +Y height axis points down -Z and the barrel spans z -1.3 to -3.3.
+    rlPushMatrix();
+    rlTranslatef(0.0f, 1.5f, -1.3f);
+    rlRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+    DrawCylinder(Vector3{ 0, 0, 0 }, 0.15f, 0.15f, 2.0f, 12, Color{ 50, 52, 48, 255 });
+    rlPopMatrix();
     // In gunner view the turret is drawn later as a translucent ghost
     // (DrawTurretGhost, after the village) so the camera inside it can see
     // the hull and the world through it. In drone view it is solid.
@@ -295,6 +424,66 @@ static void UpdateDrone(DroneCam &d, Vector2 md, float dt) {
 }
 
 // ---------------------------------------------------------------------------
+// Shooting (v0.2): shells, muzzle flash, hit detection, destruction
+// ---------------------------------------------------------------------------
+struct Shell {
+    Vector3 pos;
+    Vector3 vel;
+    float life;
+    static constexpr int TRAIL = 24;
+    Vector3 trail[TRAIL];
+    int trailCount = 0;
+};
+
+struct Flash {
+    Vector3 pos;
+    float t;      // time remaining
+    float maxT;   // total duration
+    float size;
+};
+
+static Vector3 MuzzleWorldPos(const Tank &t) {
+    Vector3 fwd = TurretForward(t);
+    // Tip of the barrel: 3.3 forward of the turret center at barrel height.
+    // Pushed 0.25 further out so the flash sits just beyond the muzzle,
+    // where the round leaves — unambiguously at the tip, not the breech.
+    return Vector3{ t.pos.x + fwd.x * 3.55f, 2.25f, t.pos.z + fwd.z * 3.55f };
+}
+
+static void FireShell(const Tank &t, std::vector<Shell> &shells, const Config &cfg) {
+    Vector3 fwd = TurretForward(t);
+    Vector3 muzzle = MuzzleWorldPos(t);
+    Shell s;
+    s.pos = muzzle;
+    s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+    s.life = cfg.shellLifetime;
+    s.trail[0] = muzzle;
+    s.trailCount = 1;
+    shells.push_back(s);
+}
+
+static bool ShellHitsBuilding(const Vector3 &p, float r, const Building &b) {
+    float hx = b.size.x * 0.5f, hy = b.size.y * 0.5f, hz = b.size.z * 0.5f;
+    float cx = Clamp(p.x, b.center.x - hx, b.center.x + hx);
+    float cy = Clamp(p.y, b.center.y - hy, b.center.y + hy);
+    float cz = Clamp(p.z, b.center.z - hz, b.center.z + hz);
+    float dx = p.x - cx, dy = p.y - cy, dz = p.z - cz;
+    return (dx * dx + dy * dy + dz * dz) < r * r;
+}
+
+static void DamageBuilding(Building &b, const Vector3 &hitPos) {
+    if (b.destroyed || b.hp <= 0) return;
+    float seed = (float)GetRandomValue(0, 1000) / 1000.0f;
+    b.marks.push_back(HitMark{ hitPos, HitFaceNormal(hitPos, b), seed });
+    if (--b.hp <= 0) {
+        b.destroyed = true;
+        b.collapseT = 0.0f;
+        float a = (float)GetRandomValue(0, 360) * DEG2RAD;
+        b.fallAxis = Vector3{ cosf(a), 0.0f, sinf(a) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -303,7 +492,11 @@ int main() {
     SetTargetFPS(60);
     DisableCursor();
 
-    std::vector<Building> village = BuildVillage();
+    Config cfg = LoadConfig();
+    std::vector<Building> village = BuildVillage(cfg.buildingHits);
+    std::vector<Shell> shells;
+    std::vector<Flash> flashes;
+    float fireCooldown = 0.0f;
     Tank tank;
     DroneCam drone;
     CamMode mode = CamMode::GUNNER;
@@ -342,6 +535,56 @@ int main() {
 
         UpdateTank(tank, village, dt, mode == CamMode::GUNNER);
 
+        fireCooldown -= dt;
+
+        // Firing: left mouse or Space, gated by cooldown. Works in both modes —
+        // in drone mode the turret fires along its current aim, so you can
+        // watch the shells from outside.
+        if ((IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsKeyDown(KEY_SPACE)) &&
+            fireCooldown <= 0.0f) {
+            FireShell(tank, shells, cfg);
+            fireCooldown = cfg.shellCooldown;
+            Vector3 muzzle = MuzzleWorldPos(tank);
+            // Compact bright burst at the muzzle tip (not a beach ball).
+            flashes.push_back(Flash{ muzzle, 0.22f, 0.22f, 0.9f });
+        }
+
+        // Shells: fly straight (flat trajectory for v0.2; parabolic + ammo
+        // types come later), expire on lifetime, damage buildings on impact.
+        for (auto it = shells.begin(); it != shells.end();) {
+            it->pos = Vector3Add(it->pos, Vector3Scale(it->vel, dt));
+            it->life -= dt;
+            // Record trail: oldest at trail[0], newest at trail[trailCount-1].
+            if (it->trailCount < Shell::TRAIL) {
+                it->trail[it->trailCount++] = it->pos;
+            } else {
+                for (int i = 0; i < Shell::TRAIL - 1; ++i) it->trail[i] = it->trail[i + 1];
+                it->trail[Shell::TRAIL - 1] = it->pos;
+            }
+            bool dead = it->life <= 0.0f;
+            if (!dead) {
+                for (auto &b : village) {
+                    if (b.destroyed) continue;
+                    if (ShellHitsBuilding(it->pos, cfg.shellRadius, b)) {
+                        DamageBuilding(b, it->pos);
+                        flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            it = dead ? shells.erase(it) : std::next(it);
+        }
+
+        // Collapse animation progress; impact/muzzle flashes decay.
+        for (auto &b : village)
+            if (b.destroyed && b.collapseT < 1.0f)
+                b.collapseT = fminf(1.0f, b.collapseT + dt / cfg.collapseDuration);
+        for (auto it = flashes.begin(); it != flashes.end();) {
+            it->t -= dt;
+            it = (it->t <= 0.0f) ? flashes.erase(it) : std::next(it);
+        }
+
         if (mode == CamMode::GUNNER) {
             // Stabilized gunner sight: the mouse sets a WORLD-space aim
             // direction, so turning the hull (A/D) swings the hull visibly
@@ -378,14 +621,31 @@ int main() {
         DrawGrid(40, 20.0f);
         DrawVillage(village);
         DrawTank(tank, mode == CamMode::GUNNER);
+        // Shells and flashes BEFORE the ghost turret: the ghost is translucent
+        // but writes depth, so anything drawn after it (and behind its far
+        // wall) would be occluded. Opaque first, translucent ghost last.
+        for (const auto &s : shells) {
+            if (s.trailCount >= 2) {
+                DrawCylinderEx(s.trail[0], s.pos, 0.22f, 0.22f, 8,
+                               Color{ 255, 175, 65, 255 });
+                // Hot core: thinner, brighter, full length.
+                DrawCylinderEx(s.trail[0], s.pos, 0.1f, 0.1f, 6,
+                               Color{ 255, 230, 150, 255 });
+            }
+            DrawSphere(s.pos, 0.35f, Color{ 255, 240, 180, 255 });
+        }
+        for (const auto &f : flashes) {
+            float a = f.t / f.maxT;
+            DrawSphere(f.pos, f.size * (0.5f + 0.5f * a), Color{ 255, 180, 60, (unsigned char)(255 * a) });
+        }
         // The ghost turret blends over the world, so it goes last.
         if (mode == CamMode::GUNNER) DrawTurretGhost(tank);
         EndMode3D();
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
-        DrawText(TextFormat("TANKSHOOTER v0.1  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
-        DrawText("W/S drive  A/D turn hull  Mouse aim  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
+        DrawText(TextFormat("TANKSHOOTER v0.2  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
+        DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
         if (mode == CamMode::GUNNER) {
             // Crosshair
             int cx = screenWidth / 2, cy = screenHeight / 2;

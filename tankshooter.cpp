@@ -44,6 +44,16 @@ struct Config {
     float enemySpread      = 0.06f;   // radians of random aim error
     float enemyAimTime     = 1.2f;    // tracking (telegraph) before firing
     float enemyCoverWait   = 4.0f;    // seconds hidden before re-emerging
+    // Ally
+    int   allyCount        = 2;
+    int   allyHits         = 2;
+    Color allyColor        = { 70, 120, 180, 255 };
+    float allySpeed        = 10.0f;
+    bool  allyEngage       = true;    // engage enemies on sight
+    float allyRange        = 70.0f;
+    float allyFireInt      = 3.5f;
+    float allySpread       = 0.06f;
+    float allyAimTime      = 1.2f;
 };
 
 // Loads Tanks.json from the working directory. Missing file or bad values
@@ -59,6 +69,7 @@ static Config LoadConfig() {
         auto building = j.value("building", nlohmann::json::object());
         auto collapse = j.value("collapse", nlohmann::json::object());
         auto enemy    = j.value("enemy", nlohmann::json::object());
+        auto ally     = j.value("ally", nlohmann::json::object());
         auto player   = j.value("player", nlohmann::json::object());
         c.shellSpeed       = shell.value("speed", c.shellSpeed);
         c.shellCooldown    = shell.value("cooldownSeconds", c.shellCooldown);
@@ -77,10 +88,22 @@ static Config LoadConfig() {
         c.enemySpread      = enemy.value("aimSpread", c.enemySpread);
         c.enemyAimTime     = enemy.value("aimTime", c.enemyAimTime);
         c.enemyCoverWait   = enemy.value("coverWaitTime", c.enemyCoverWait);
+        c.allyCount        = ally.value("count", c.allyCount);
+        c.allyHits         = ally.value("hitsToDestroy", c.allyHits);
+        c.allySpeed        = ally.value("speed", c.allySpeed);
+        c.allyEngage       = ally.value("engageOnSight", c.allyEngage);
+        c.allyRange        = ally.value("shootRange", c.allyRange);
+        c.allyFireInt      = ally.value("fireInterval", c.allyFireInt);
+        c.allySpread       = ally.value("aimSpread", c.allySpread);
+        c.allyAimTime      = ally.value("aimTime", c.allyAimTime);
         auto ec = enemy.value("color", nlohmann::json::object());
         c.enemyColor.r = (unsigned char)ec.value("r", (int)c.enemyColor.r);
         c.enemyColor.g = (unsigned char)ec.value("g", (int)c.enemyColor.g);
         c.enemyColor.b = (unsigned char)ec.value("b", (int)c.enemyColor.b);
+        auto ac = ally.value("color", nlohmann::json::object());
+        c.allyColor.r = (unsigned char)ac.value("r", (int)c.allyColor.r);
+        c.allyColor.g = (unsigned char)ac.value("g", (int)c.allyColor.g);
+        c.allyColor.b = (unsigned char)ac.value("b", (int)c.allyColor.b);
     } catch (...) { /* keep defaults */ }
     return c;
 }
@@ -551,6 +574,37 @@ struct Enemy {
     float burnAccum = 0.0f;   // spawner accumulator for wreck smoke/flame
 };
 
+// Allied tank orders (v0.6, issued in drone mode).
+enum class AllyOrder { FOLLOW, MOVE, HOLD, ATTACK };
+
+// Allied tank: follows player orders, engages enemies on sight (if
+// configured). Death uses the same turret-pop + burning wreck as enemies.
+struct Ally {
+    Vector3 pos;
+    float hullAngle   = 0.0f;
+    float turretAngle = 0.0f;
+    int hp = 2;
+    int maxHp = 2;
+    bool alive = true;
+    float hitFlashT = 0.0f;
+    // Orders.
+    AllyOrder order = AllyOrder::FOLLOW;
+    Vector3 orderPos = { 0, 0, 0 };  // MOVE destination
+    int targetEnemy = -1;           // ATTACK: index into enemies
+    // Combat state.
+    float aimTimer = 0.0f;
+    float fireTimer = 0.0f;
+    int engageIdx = -1;             // enemy currently being shot at
+    // Death animation (same as Enemy).
+    float deathT = 0.0f;
+    Vector3 turretPos;
+    Vector3 turretVel;
+    float turretSpin = 0.0f;
+    float turretSpinVel = 0.0f;
+    bool turretLanded = false;
+    float burnAccum = 0.0f;
+};
+
 static Vector3 MuzzleWorldPos(const Tank &t) {
     Vector3 fwd = TurretForward(t);
     // Tip of the barrel: 3.3 forward of the turret center at barrel height.
@@ -737,6 +791,9 @@ static void DamageBuilding(Building &b, const Vector3 &hitPos) {
 }
 
 // ---------------------------------------------------------------------------
+// Ally tanks
+// ---------------------------------------------------------------------------
+
 // Enemy tanks
 // ---------------------------------------------------------------------------
 // Deterministic scatter: clear of buildings, of the player spawn, and of
@@ -774,6 +831,21 @@ static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Bu
     return out;
 }
 
+// Allies spawn in formation near the player (south-west corner).
+static std::vector<Ally> SpawnAllies(int count, int hits, const Vector3 &playerPos) {
+    std::vector<Ally> out;
+    for (int i = 0; i < count; ++i) {
+        Ally a;
+        // Echelon left: behind and to the side of the player.
+        a.pos = { playerPos.x - 8.0f - (float)i * 7.0f, 0.0f, playerPos.z + 6.0f + (float)i * 4.0f };
+        a.hullAngle = 0.0f;
+        a.hp = a.maxHp = hits;
+        a.order = AllyOrder::FOLLOW;
+        out.push_back(a);
+    }
+    return out;
+}
+
 // Generous hitbox: vertical cylinder around the tank. Shells fly at
 // turret height, so this reads as hitting the turret/mass.
 static bool ShellHitsEnemy(const Vector3 &p, float r, const Enemy &e) {
@@ -798,6 +870,182 @@ static void Burst(std::vector<Particle> &ps, Vector3 c, int n,
         ps.push_back(p);
     }
 }
+// Wreck animation shared by enemy and ally deaths (turret pop + burn).
+template <typename T>
+static void UpdateWreckAnim(T &u, std::vector<Particle> &particles, float dt) {
+    u.deathT += dt;
+    if (!u.turretLanded) {
+        u.turretVel.y -= 22.0f * dt;
+        u.turretPos = Vector3Add(u.turretPos, Vector3Scale(u.turretVel, dt));
+        u.turretSpin += u.turretSpinVel * dt;
+        if (u.turretPos.y <= 0.55f) {
+            u.turretPos.y = 0.55f;
+            float dx = u.turretPos.x - u.pos.x, dz = u.turretPos.z - u.pos.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < 20.25f) {
+                float d = sqrtf(d2);
+                if (d < 1e-3f) { dx = 1.0f; dz = 0.0f; d = 1.0f; }
+                u.turretPos.x = u.pos.x + dx / d * 4.5f;
+                u.turretPos.z = u.pos.z + dz / d * 4.5f;
+            }
+            u.turretLanded = true;
+        }
+    }
+    u.burnAccum += dt;
+    while (u.burnAccum >= 0.22f) {
+        u.burnAccum -= 0.22f;
+        Vector3 fp = { u.pos.x + (float)GetRandomValue(-80, 80) / 100.0f, 1.4f,
+                       u.pos.z + (float)GetRandomValue(-80, 80) / 100.0f };
+        particles.push_back(Particle{ fp,
+            { (float)GetRandomValue(-10, 10) / 10.0f, (float)GetRandomValue(20, 45) / 10.0f,
+              (float)GetRandomValue(-10, 10) / 10.0f },
+            (float)GetRandomValue(5, 9) / 10.0f, (float)GetRandomValue(30, 55) / 100.0f,
+            0.5f, Color{ 255, 140, 30, 255 }, 6.0f });
+        Vector3 sp = { u.pos.x, 2.2f, u.pos.z };
+        particles.push_back(Particle{ sp,
+            { (float)GetRandomValue(-8, 8) / 10.0f, (float)GetRandomValue(25, 50) / 10.0f,
+              (float)GetRandomValue(-8, 8) / 10.0f },
+            (float)GetRandomValue(18, 30) / 10.0f, (float)GetRandomValue(80, 130) / 100.0f,
+            0.8f, Color{ 70, 65, 60, 255 }, -3.0f });
+    }
+}
+
+// Shared kill sequence: fireball, particles, turret pop.
+template <typename T>
+static void KillUnit(T &u, std::vector<Particle> &particles, std::vector<Flash> &flashes) {
+    u.alive = false;
+    u.deathT = 0.0f;
+    Vector3 c = { u.pos.x, 1.6f, u.pos.z };
+    flashes.push_back(Flash{ c, 0.55f, 0.55f, 3.8f });
+    Burst(particles, c, 10, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 0.9f, 0.7f, 6.0f);
+    Burst(particles, c, 12, Color{ 90, 85, 80, 255 }, 4.0f, 9.0f, 1.4f, 2.6f, -3.0f);
+    Burst(particles, c, 6, Color{ 255, 220, 120, 255 }, 14.0f, 5.0f, 0.5f, 0.4f, 10.0f);
+    u.turretPos = { u.pos.x, 2.25f, u.pos.z };
+    float popA = (float)GetRandomValue(0, 360) * DEG2RAD;
+    float popS = (float)GetRandomValue(50, 80) / 10.0f;
+    u.turretVel = { cosf(popA) * popS,
+                    (float)GetRandomValue(75, 115) / 10.0f,
+                    sinf(popA) * popS };
+    u.turretSpinVel = (float)GetRandomValue(-9, 9);
+    u.turretLanded = false;
+    u.burnAccum = 0.0f;
+}
+static void DamageAlly(Ally &a, std::vector<Particle> &particles, std::vector<Flash> &flashes) {
+    if (!a.alive) return;
+    a.hitFlashT = 0.18f;
+    if (--a.hp > 0) return;
+    KillUnit(a, particles, flashes);
+}
+
+static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
+                         std::vector<Enemy> &enemies, const std::vector<Building> &village,
+                         std::vector<Shell> &shells, std::vector<Flash> &flashes,
+                         std::vector<Particle> &particles, const Config &cfg, float dt) {
+    for (size_t ai = 0; ai < allies.size(); ++ai) {
+        Ally &a = allies[ai];
+        if (!a.alive) {
+            UpdateWreckAnim(a, particles, dt);
+            continue;
+        }
+        if (a.hitFlashT > 0.0f) a.hitFlashT -= dt;
+        a.fireTimer += dt;
+
+        // Pick a target: explicit ATTACK order, else nearest visible in range.
+        int tgt = -1;
+        if (a.order == AllyOrder::ATTACK && a.targetEnemy >= 0 &&
+            a.targetEnemy < (int)enemies.size() && enemies[a.targetEnemy].alive) {
+            tgt = a.targetEnemy;
+        } else if (cfg.allyEngage) {
+            float bestD2 = cfg.allyRange * cfg.allyRange;
+            Vector3 eye = { a.pos.x, 2.25f, a.pos.z };
+            for (size_t ei = 0; ei < enemies.size(); ++ei) {
+                if (!enemies[ei].alive) continue;
+                float dx = enemies[ei].pos.x - a.pos.x, dz = enemies[ei].pos.z - a.pos.z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 > bestD2) continue;
+                Vector3 et = { enemies[ei].pos.x, 2.0f, enemies[ei].pos.z };
+                if (LosBlocked(eye, et, village)) continue;
+                bestD2 = d2; tgt = (int)ei;
+            }
+        }
+        a.engageIdx = tgt;
+
+        auto driveToward = [&](float wantAngle, float speed) {
+            float diff = NormalizeAngle(wantAngle - a.hullAngle);
+            a.hullAngle += Clamp(diff * 3.0f, -1.6f, 1.6f) * dt;
+            float throttle = (fabsf(diff) < 0.6f) ? 1.0f : 0.25f;
+            a.pos.x += sinf(a.hullAngle) * speed * throttle * dt;
+            a.pos.z += -cosf(a.hullAngle) * speed * throttle * dt;
+        };
+
+        if (tgt >= 0) {
+            // Engaging: turret tracks, fire when locked.
+            Enemy &e = enemies[tgt];
+            float dx = e.pos.x - a.pos.x, dz = e.pos.z - a.pos.z;
+            float dist = sqrtf(dx * dx + dz * dz);
+            float wantWorld = atan2f(dx, -dz);
+            float wantTurret = NormalizeAngle(wantWorld - a.hullAngle);
+            float tdiff = NormalizeAngle(wantTurret - a.turretAngle);
+            a.turretAngle += Clamp(tdiff * 4.0f, -2.5f, 2.5f) * dt;
+            Vector3 eye = { a.pos.x, 2.25f, a.pos.z };
+            Vector3 et = { e.pos.x, 2.0f, e.pos.z };
+            if (!LosBlocked(eye, et, village) && dist < cfg.allyRange) {
+                a.aimTimer += dt;
+                if (a.aimTimer >= cfg.allyAimTime && a.fireTimer >= cfg.allyFireInt) {
+                    float spread = ((float)GetRandomValue(-100, 100) / 100.0f) * cfg.allySpread;
+                    float fa = a.hullAngle + a.turretAngle + spread;
+                    Vector3 fwd = { sinf(fa), 0.0f, -cosf(fa) };
+                    Vector3 muzzle = { a.pos.x + fwd.x * 3.55f, 2.25f, a.pos.z + fwd.z * 3.55f };
+                    Shell s;
+                    s.pos = muzzle;
+                    s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+                    s.life = cfg.shellLifetime;
+                    s.fromEnemy = false;  // hits enemies, not the player
+                    shells.push_back(s);
+                    flashes.push_back(Flash{ muzzle, 0.22f, 0.22f, 0.9f });
+                    a.fireTimer = 0.0f;
+                    a.aimTimer = 0.0f;
+                }
+            } else {
+                a.aimTimer = 0.0f;
+            }
+            // ATTACK order closes distance; otherwise hold while shooting.
+            if (a.order == AllyOrder::ATTACK && dist > cfg.allyRange * 0.7f)
+                driveToward(wantWorld, cfg.allySpeed);
+        } else {
+            // No target: follow orders.
+            a.aimTimer = 0.0f;
+            a.turretAngle = NormalizeAngle(a.turretAngle - a.turretAngle * fminf(dt * 2.0f, 1.0f));
+            Vector3 dest = a.pos;
+            bool move = false;
+            if (a.order == AllyOrder::FOLLOW) {
+                float pa = player.hullAngle;
+                Vector3 fwd = { sinf(pa), 0.0f, -cosf(pa) };
+                Vector3 right = { -fwd.z, 0.0f, fwd.x };
+                float side = (allies.size() <= 2) ? (ai == 0 ? -7.0f : 7.0f)
+                                                  : ((float)ai - (float)(allies.size() - 1) / 2.0f) * 7.0f;
+                dest = { player.pos.x - fwd.x * 10.0f + right.x * side, 0.0f,
+                         player.pos.z - fwd.z * 10.0f + right.z * side };
+                move = true;
+            } else if (a.order == AllyOrder::MOVE) {
+                dest = a.orderPos;
+                move = true;
+            }
+            if (move) {
+                float dx = dest.x - a.pos.x, dz = dest.z - a.pos.z;
+                if (dx * dx + dz * dz > 9.0f) {
+                    driveToward(atan2f(dx, -dz), cfg.allySpeed);
+                } else if (a.order == AllyOrder::MOVE) {
+                    a.order = AllyOrder::HOLD;  // arrived
+                }
+            }
+        }
+
+        ResolveBuildingCollisions(a.pos, village);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
                         std::vector<Flash> &flashes, const Vector3 &playerPos,
@@ -921,24 +1169,63 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
     }
 }
 
+// Allies: blue armor, selection ring for the ordered unit, objective marker.
+static void DrawAllies(const std::vector<Ally> &allies, const std::vector<Enemy> &enemies,
+                       const Config &cfg, int selected) {
+    static const Color CHARRED = { 38, 33, 28, 255 };
+    for (size_t i = 0; i < allies.size(); ++i) {
+        const auto &a = allies[i];
+        if (a.alive) {
+            Color armor = cfg.allyColor;
+            if (a.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
+            DrawTankHull(a.pos, a.hullAngle, armor);
+            DrawTankTurret(Vector3{ a.pos.x, 2.25f, a.pos.z },
+                           a.hullAngle + a.turretAngle, armor);
+            // Selected: white pulsing ring.
+            if ((int)i == selected) {
+                float pulse = 2.8f + sinf((float)GetTime() * 6.0f) * 0.4f;
+                DrawCylinderWires(Vector3{ a.pos.x, 0.08f, a.pos.z },
+                                  pulse, pulse, 0.12f, 24, Color{ 255, 255, 255, 230 });
+            }
+            // Objective marker.
+            if (a.order == AllyOrder::MOVE) {
+                DrawCylinderWires(Vector3{ a.orderPos.x, 0.08f, a.orderPos.z },
+                                  1.5f, 1.5f, 0.12f, 16, Color{ 80, 160, 255, 230 });
+            } else if (a.order == AllyOrder::ATTACK && a.targetEnemy >= 0 &&
+                       a.targetEnemy < (int)enemies.size() && enemies[a.targetEnemy].alive) {
+                const auto &e = enemies[a.targetEnemy];
+                DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z },
+                                  3.2f, 3.2f, 0.12f, 24, Color{ 255, 80, 80, 230 });
+            }
+        } else {
+            DrawTankHull(a.pos, a.hullAngle, CHARRED);
+            DrawTankTurret(a.turretPos, a.turretSpin, CHARRED);
+            float f = 0.75f + 0.25f * sinf(a.deathT * 13.0f);
+            DrawSphere(Vector3{ a.pos.x, 1.7f, a.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
     const int screenWidth = 1280, screenHeight = 720;
-    InitWindow(screenWidth, screenHeight, "Tankshooter v0.5");
+    InitWindow(screenWidth, screenHeight, "Tankshooter v0.6");
     SetTargetFPS(60);
     DisableCursor();
 
     Config cfg = LoadConfig();
     std::vector<Building> village = BuildVillage(cfg.buildingHits);
     std::vector<Enemy> enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
+    Tank tank;
+    tank.hp = tank.maxHp = cfg.playerHits;
+    std::vector<Ally> allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
+    int selectedAlly = 0;
     std::vector<Shell> shells;
     std::vector<Flash> flashes;
     std::vector<Particle> particles;
     float fireCooldown = 0.0f;
-    Tank tank;
-    tank.hp = tank.maxHp = cfg.playerHits;
     DroneCam drone;
     CamMode mode = CamMode::GUNNER;
     bool gameOver = false;
@@ -958,11 +1245,13 @@ int main() {
         int aliveNow = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveNow;
         if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
-            // Restart: fresh village, enemies, player.
+            // Restart: fresh village, enemies, allies, player.
             tank = Tank{};
             tank.hp = tank.maxHp = cfg.playerHits;
             village = BuildVillage(cfg.buildingHits);
             enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
+            allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
+            selectedAlly = 0;
             shells.clear(); flashes.clear(); particles.clear();
             fireCooldown = 0.0f;
             mode = CamMode::GUNNER;
@@ -990,6 +1279,53 @@ int main() {
             }
         }
         tabWasDown = tabDown;
+
+        // Ally orders (drone mode only): 1..N select, right-click ground =
+        // move, right-click enemy = attack, F = follow, H = hold.
+        if (mode == CamMode::DRONE && !allies.empty()) {
+            for (size_t i = 0; i < allies.size() && i < 9; ++i) {
+                if (IsKeyPressed(KEY_ONE + (int)i)) selectedAlly = (int)i;
+            }
+            if (selectedAlly >= (int)allies.size()) selectedAlly = 0;
+            Ally &sel = allies[selectedAlly];
+            if (IsKeyPressed(KEY_F) && sel.alive) {
+                sel.order = AllyOrder::FOLLOW;
+                sel.targetEnemy = -1;
+            }
+            if (IsKeyPressed(KEY_H) && sel.alive) {
+                sel.order = AllyOrder::HOLD;
+                sel.targetEnemy = -1;
+            }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && sel.alive) {
+                // Raycast to the ground plane.
+                Ray ray = GetScreenToWorldRay(GetMousePosition(), camera);
+                if (fabsf(ray.direction.y) > 1e-4f) {
+                    float t = -ray.position.y / ray.direction.y;
+                    if (t > 0.0f) {
+                        Vector3 gp = { ray.position.x + ray.direction.x * t, 0.0f,
+                                       ray.position.z + ray.direction.z * t };
+                        // Enemy under the cursor? Attack it. Else move there.
+                        int hitEnemy = -1;
+                        for (size_t ei = 0; ei < enemies.size(); ++ei) {
+                            if (!enemies[ei].alive) continue;
+                            float dx = gp.x - enemies[ei].pos.x, dz = gp.z - enemies[ei].pos.z;
+                            if (dx * dx + dz * dz < 16.0f) { hitEnemy = (int)ei; break; }
+                        }
+                        if (hitEnemy >= 0) {
+                            sel.order = AllyOrder::ATTACK;
+                            sel.targetEnemy = hitEnemy;
+                        } else {
+                            // Clamp inside the arena.
+                            gp.x = Clamp(gp.x, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
+                            gp.z = Clamp(gp.z, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
+                            sel.order = AllyOrder::MOVE;
+                            sel.orderPos = gp;
+                            sel.targetEnemy = -1;
+                        }
+                    }
+                }
+            }
+        }
 
         UpdateTank(tank, village, dt, mode == CamMode::GUNNER, cfg.playerSpeed);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
@@ -1034,7 +1370,7 @@ int main() {
             }
             if (!dead) {
                 if (it->fromEnemy) {
-                    // Hostile shell: hits the player.
+                    // Hostile shell: hits the player and allies.
                     float pdx = it->pos.x - tank.pos.x, pdz = it->pos.z - tank.pos.z;
                     float prr = 2.2f + cfg.shellRadius;
                     if (pdx * pdx + pdz * pdz < prr * prr && it->pos.y > 0.0f && it->pos.y < 3.2f) {
@@ -1045,6 +1381,17 @@ int main() {
                         Burst(particles, hc, 8, Color{ 255, 150, 40, 255 }, 7.0f, 6.0f, 0.7f, 0.6f, 6.0f);
                         if (tank.hp <= 0) gameOver = true;
                         dead = true;
+                    }
+                    if (!dead) {
+                        for (auto &a : allies) {
+                            float adx = it->pos.x - a.pos.x, adz = it->pos.z - a.pos.z;
+                            if (adx * adx + adz * adz < prr * prr && it->pos.y > 0.0f && it->pos.y < 3.2f) {
+                                DamageAlly(a, particles, flashes);
+                                flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                                dead = true;
+                                break;
+                            }
+                        }
                     }
                 } else {
                     for (auto &e : enemies) {
@@ -1064,6 +1411,8 @@ int main() {
         for (auto &e : enemies)
             UpdateEnemyAI(e, tank, village, shells, flashes, cfg, dt);
         UpdateEnemies(enemies, particles, dt);
+        // Ally AI (orders + engage) + death animations.
+        UpdateAllies(allies, tank, enemies, village, shells, flashes, particles, cfg, dt);
         // Wrecks block enemies too; enemies keep separation from each other.
         for (auto &e : enemies) {
             if (!e.alive) continue;
@@ -1077,6 +1426,17 @@ int main() {
                     e.pos.x = o.pos.x + sx / d * 5.0f;
                     e.pos.z = o.pos.z + sz / d * 5.0f;
                 }
+            }
+        }
+        // Ally wrecks block the player as well.
+        for (const auto &a : allies) {
+            if (a.alive || !cfg.wreckBlocks) continue;
+            float dx = tank.pos.x - a.pos.x, dz = tank.pos.z - a.pos.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < 4.0f && d2 > 1e-4f) {
+                float d = sqrtf(d2);
+                tank.pos.x = a.pos.x + dx / d * 2.0f;
+                tank.pos.z = a.pos.z + dz / d * 2.0f;
             }
         }
 
@@ -1127,6 +1487,7 @@ int main() {
         DrawVillage(village);
         DrawTank(tank, mode == CamMode::GUNNER);
         DrawEnemies(enemies, cfg);
+        DrawAllies(allies, enemies, cfg, selectedAlly);
         // Shells and flashes BEFORE the ghost turret: the ghost is translucent
         // but writes depth, so anything drawn after it (and behind its far
         // wall) would be occluded. Opaque first, translucent ghost last.
@@ -1156,13 +1517,31 @@ int main() {
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
-        DrawText(TextFormat("TANKSHOOTER v0.5  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
+        DrawText(TextFormat("TANKSHOOTER v0.6  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
         DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
         DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 90, 20,
                  tank.hp > 1 ? DARKGREEN : RED);
+        // Ally status: order + HP for each.
+        for (size_t i = 0; i < allies.size(); ++i) {
+            const auto &a = allies[i];
+            const char *on = "?";
+            if (!a.alive) on = "DEAD";
+            else if (a.order == AllyOrder::FOLLOW) on = "FOLLOW";
+            else if (a.order == AllyOrder::MOVE) on = "MOVE";
+            else if (a.order == AllyOrder::HOLD) on = "HOLD";
+            else if (a.order == AllyOrder::ATTACK) on = "ATTACK";
+            Color c = (i == (size_t)selectedAlly) ? WHITE : LIGHTGRAY;
+            if (!a.alive) c = RED;
+            DrawText(TextFormat("Ally %d [%s] %d/%d", (int)i + 1, on, a.hp, a.maxHp),
+                     16, 116 + (int)i * 22, 18, c);
+        }
+        if (mode == CamMode::DRONE) {
+            int y0 = 116 + (int)allies.size() * 22 + 6;
+            DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
+        }
         // Tracking ping: any enemy with an active lock?
         bool tracked = false;
         for (const auto &e : enemies)

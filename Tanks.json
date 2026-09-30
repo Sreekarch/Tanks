@@ -1,1 +1,3 @@
-{"building":{"hitsToDestroy":3},"collapse":{"durationSeconds":1.6},"shell":{"cooldownSeconds":1.5,"lifetimeSeconds":4.0,"radius":0.18,"speed":70.0}}
+{"building":{"hitsToDestroy":3},"collapse":{"durationSeconds":1.6},
+ "enemy":{"color":{"b":50,"g":70,"r":165},"count":4,"hitsToDestroy":2,"wreckBlocksMovement":true},
+ "shell":{"cooldownSeconds":1.5,"lifetimeSeconds":4.0,"radius":0.18,"speed":70.0}}

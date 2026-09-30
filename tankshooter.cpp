@@ -30,6 +30,10 @@ struct Config {
     float shellRadius      = 0.18f;
     int   buildingHits     = 3;
     float collapseDuration = 1.6f;
+    int   enemyCount       = 4;
+    int   enemyHits        = 2;
+    bool  wreckBlocks      = true;
+    Color enemyColor       = { 165, 70, 50, 255 };
 };
 
 // Loads Tanks.json from the working directory. Missing file or bad values
@@ -44,12 +48,20 @@ static Config LoadConfig() {
         auto shell    = j.value("shell", nlohmann::json::object());
         auto building = j.value("building", nlohmann::json::object());
         auto collapse = j.value("collapse", nlohmann::json::object());
+        auto enemy    = j.value("enemy", nlohmann::json::object());
         c.shellSpeed       = shell.value("speed", c.shellSpeed);
         c.shellCooldown    = shell.value("cooldownSeconds", c.shellCooldown);
         c.shellLifetime    = shell.value("lifetimeSeconds", c.shellLifetime);
         c.shellRadius      = shell.value("radius", c.shellRadius);
         c.buildingHits     = building.value("hitsToDestroy", c.buildingHits);
         c.collapseDuration = collapse.value("durationSeconds", c.collapseDuration);
+        c.enemyCount       = enemy.value("count", c.enemyCount);
+        c.enemyHits        = enemy.value("hitsToDestroy", c.enemyHits);
+        c.wreckBlocks      = enemy.value("wreckBlocksMovement", c.wreckBlocks);
+        auto ec = enemy.value("color", nlohmann::json::object());
+        c.enemyColor.r = (unsigned char)ec.value("r", (int)c.enemyColor.r);
+        c.enemyColor.g = (unsigned char)ec.value("g", (int)c.enemyColor.g);
+        c.enemyColor.b = (unsigned char)ec.value("b", (int)c.enemyColor.b);
     } catch (...) { /* keep defaults */ }
     return c;
 }
@@ -316,19 +328,21 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt, 
     ResolveBuildingCollisions(t.pos, village);
 }
 
-static void DrawTank(const Tank &t, bool gunnerView) {
-    // Hull
-    Vector3 fwd = { sinf(t.hullAngle), 0.0f, -cosf(t.hullAngle) };
-    Vector3 right = { -fwd.z, 0.0f, fwd.x };
-    Vector3 hullC = { t.pos.x, 0.75f, t.pos.z };
+// Hull mesh shared by the player and enemies. armor is the base color;
+// the deck is derived lighter, treads/drums stay fixed.
+static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor) {
+    Color deck = { (unsigned char)fminf(armor.r * 1.14f, 255.0f),
+                   (unsigned char)fminf(armor.g * 1.14f, 255.0f),
+                   (unsigned char)fminf(armor.b * 1.14f, 255.0f), 255 };
+    Vector3 hullC = { pos.x, 0.75f, pos.z };
 
     rlPushMatrix();
     rlTranslatef(hullC.x, hullC.y, hullC.z);
     // NOTE: negated — rlRotatef(+a) about Y turns local -Z toward -X, but our
     // angle convention faces (sin a, 0, -cos a), i.e. toward +X for a > 0.
-    rlRotatef(-t.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    DrawCube(Vector3{ 0, 0, 0 }, 3.2f, 1.1f, 4.6f, Color{ 74, 94, 62, 255 });       // hull
-    DrawCube(Vector3{ 0, 0.75f, -0.4f }, 2.4f, 0.5f, 2.6f, Color{ 84, 106, 70, 255 }); // upper deck
+    rlRotatef(-hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    DrawCube(Vector3{ 0, 0, 0 }, 3.2f, 1.1f, 4.6f, armor);                         // hull
+    DrawCube(Vector3{ 0, 0.75f, -0.4f }, 2.4f, 0.5f, 2.6f, deck);                  // upper deck
     DrawCube(Vector3{ -1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, Color{ 45, 48, 44, 255 }); // treads
     DrawCube(Vector3{ 1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, Color{ 45, 48, 44, 255 });
     // Forward/back cues so the gunner can read hull direction at a glance:
@@ -343,24 +357,53 @@ static void DrawTank(const Tank &t, bool gunnerView) {
         DrawCylinder(Vector3{ 0, 0, 0 }, 0.28f, 0.28f, 0.9f, 10, Color{ 130, 75, 45, 255 }); // fuel drum
         rlPopMatrix();
     }
-    // Turret (rotates relative to hull)
-    rlRotatef(-t.turretAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    // Barrel: a cylinder laid along -Z (forward), breech at the turret wall.
-    // DrawCylinder's position is its base, so after rotating -90 deg about X
-    // the +Y height axis points down -Z and the barrel spans z -1.3 to -3.3.
+    rlPopMatrix();
+}
+
+// Barrel only. In gunner view the turret body is a translucent ghost but the
+// gun itself stays solid — the gunner needs to see where it's pointing.
+static void DrawTankBarrel(const Vector3 &center, float totalAngle) {
     rlPushMatrix();
-    rlTranslatef(0.0f, 1.5f, -1.3f);
+    rlTranslatef(center.x, center.y, center.z);
+    rlRotatef(-totalAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    // Barrel: a cylinder laid along -Z (forward), breech at the turret wall.
+    // After rotating -90 deg about X the +Y height axis points down -Z and
+    // the barrel spans z -1.3 to -3.3 from the turret center.
+    rlPushMatrix();
+    rlTranslatef(0.0f, 0.0f, -1.3f);
     rlRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
     DrawCylinder(Vector3{ 0, 0, 0 }, 0.15f, 0.15f, 2.0f, 12, Color{ 50, 52, 48, 255 });
     rlPopMatrix();
-    // In gunner view the turret is drawn later as a translucent ghost
-    // (DrawTurretGhost, after the village) so the camera inside it can see
-    // the hull and the world through it. In drone view it is solid.
-    if (!gunnerView) {
-        // NOTE: DrawCylinder's position is its BASE: this spans y 1.9–2.6 world.
-        DrawCylinder(Vector3{ 0, 1.15f, 0 }, 1.15f, 1.35f, 0.7f, 12, Color{ 74, 94, 62, 255 });
-    }
     rlPopMatrix();
+}
+
+// Turret mesh (cylinder + barrel) centered at `center` (world), rotated by
+// totalAngle = hullAngle + turretAngle. Used attached for player/enemies,
+// and detached (with a spin) for a popped wreck turret.
+static void DrawTankTurret(const Vector3 &center, float totalAngle, Color armor) {
+    rlPushMatrix();
+    rlTranslatef(center.x, center.y, center.z);
+    rlRotatef(-totalAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    // NOTE: DrawCylinder's position is its BASE: base at -0.35 puts the
+    // 0.7-tall cylinder spanning y -0.35..+0.35 around the center.
+    DrawCylinder(Vector3{ 0, -0.35f, 0 }, 1.15f, 1.35f, 0.7f, 12, armor);
+    rlPopMatrix();
+    DrawTankBarrel(center, totalAngle);
+}
+
+static void DrawTank(const Tank &t, bool gunnerView) {
+    static const Color PLAYER_ARMOR = { 74, 94, 62, 255 };
+    DrawTankHull(t.pos, t.hullAngle, PLAYER_ARMOR);
+    Vector3 tc = { t.pos.x, 2.25f, t.pos.z };
+    float ta = t.hullAngle + t.turretAngle;
+    if (!gunnerView) {
+        // Solid turret in drone view.
+        DrawTankTurret(tc, ta, PLAYER_ARMOR);
+    } else {
+        // Gunner view: solid barrel now, translucent turret body later
+        // (DrawTurretGhost) so the camera inside can see through it.
+        DrawTankBarrel(tc, ta);
+    }
 
     // Heading whisker so turret direction is readable from the drone.
     // Hidden in gunner view where it would cross the camera.
@@ -369,7 +412,6 @@ static void DrawTank(const Tank &t, bool gunnerView) {
         Vector3 tf = TurretForward(t);
         DrawLine3D(tp, Vector3{ tp.x + tf.x * 8.0f, tp.y, tp.z + tf.z * 8.0f }, YELLOW);
     }
-    (void)right;
 }
 
 // Translucent turret shell for the gunner view. Drawn AFTER the village so the
@@ -442,6 +484,39 @@ struct Flash {
     float size;
 };
 
+// Lightweight particle for explosions, smoke, and fire. No pooling —
+// counts stay small (a kill bursts ~15), so a vector is fine.
+struct Particle {
+    Vector3 pos;
+    Vector3 vel;
+    float life;
+    float maxLife;
+    float size;
+    Color color;
+    float grav;   // vertical accel; negative rises (smoke), positive falls
+};
+
+// Enemy tank: stationary in v0.4 (movement + shooting AI arrives in v0.5).
+// On death the turret pops off ballistically and the hull becomes a
+// persistent burning wreck.
+struct Enemy {
+    Vector3 pos;
+    float hullAngle   = 0.0f;
+    float turretAngle = 0.0f;
+    int hp = 2;
+    int maxHp = 2;
+    bool alive = true;
+    float hitFlashT = 0.0f;   // white hit feedback timer
+    // Death animation state.
+    float deathT = 0.0f;
+    Vector3 turretPos;        // detached turret world position
+    Vector3 turretVel;
+    float turretSpin = 0.0f;
+    float turretSpinVel = 0.0f;
+    bool turretLanded = false;
+    float burnAccum = 0.0f;   // spawner accumulator for wreck smoke/flame
+};
+
 static Vector3 MuzzleWorldPos(const Tank &t) {
     Vector3 fwd = TurretForward(t);
     // Tip of the barrel: 3.3 forward of the turret center at barrel height.
@@ -484,6 +559,177 @@ static void DamageBuilding(Building &b, const Vector3 &hitPos) {
 }
 
 // ---------------------------------------------------------------------------
+// Enemy tanks
+// ---------------------------------------------------------------------------
+// Deterministic scatter: clear of buildings, of the player spawn, and of
+// each other. Stationary until v0.5 AI.
+static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Building> &village) {
+    std::vector<Enemy> out;
+    SetRandomSeed(4242);
+    int guard = 0;
+    while ((int)out.size() < count && guard++ < 2000) {
+        float x = (float)GetRandomValue(-140, 140);
+        float z = (float)GetRandomValue(-140, 140);
+        // Keep clear of the player spawn (south-west).
+        float dx = x - (-ARENA_HALF + 30.0f), dz = z - (ARENA_HALF - 30.0f);
+        if (dx * dx + dz * dz < 45.0f * 45.0f) continue;
+        // Not inside (or hugging) a building.
+        bool bad = false;
+        for (const auto &b : village) {
+            if (fabsf(x - b.center.x) < b.size.x * 0.5f + 5.0f &&
+                fabsf(z - b.center.z) < b.size.z * 0.5f + 5.0f) { bad = true; break; }
+        }
+        if (bad) continue;
+        // Spaced from other enemies.
+        for (const auto &e : out) {
+            float ex = x - e.pos.x, ez = z - e.pos.z;
+            if (ex * ex + ez * ez < 30.0f * 30.0f) { bad = true; break; }
+        }
+        if (bad) continue;
+        Enemy e;
+        e.pos = { x, 0.0f, z };
+        e.hullAngle = (float)GetRandomValue(0, 360) * DEG2RAD;
+        e.turretAngle = (float)GetRandomValue(-60, 60) * DEG2RAD;
+        e.hp = e.maxHp = hits;
+        out.push_back(e);
+    }
+    return out;
+}
+
+// Generous hitbox: vertical cylinder around the tank. Shells fly at
+// turret height, so this reads as hitting the turret/mass.
+static bool ShellHitsEnemy(const Vector3 &p, float r, const Enemy &e) {
+    if (!e.alive) return false;
+    float dx = p.x - e.pos.x, dz = p.z - e.pos.z;
+    float rr = 2.2f + r;
+    return dx * dx + dz * dz < rr * rr && p.y > 0.0f && p.y < 3.2f;
+}
+
+static void Burst(std::vector<Particle> &ps, Vector3 c, int n,
+                  Color color, float speed, float up, float size, float life, float grav) {
+    for (int i = 0; i < n; ++i) {
+        float a = (float)GetRandomValue(0, 360) * DEG2RAD;
+        float s = (float)GetRandomValue(20, 100) / 100.0f * speed;
+        Particle p;
+        p.pos = c;
+        p.vel = { cosf(a) * s, up * ((float)GetRandomValue(50, 130) / 100.0f), sinf(a) * s };
+        p.life = p.maxLife = life * ((float)GetRandomValue(70, 130) / 100.0f);
+        p.size = size * ((float)GetRandomValue(70, 130) / 100.0f);
+        p.color = color;
+        p.grav = grav;
+        ps.push_back(p);
+    }
+}
+
+static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
+                        std::vector<Flash> &flashes) {
+    if (!e.alive) return;
+    e.hitFlashT = 0.18f;
+    if (--e.hp > 0) return;
+    // Kill: fireball flash, flame + smoke burst, turret pops off.
+    e.alive = false;
+    e.deathT = 0.0f;
+    Vector3 c = { e.pos.x, 1.6f, e.pos.z };
+    flashes.push_back(Flash{ c, 0.55f, 0.55f, 3.8f });
+    Burst(particles, c, 10, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 0.9f, 0.7f, 6.0f);   // flames
+    Burst(particles, c, 12, Color{ 90, 85, 80, 255 }, 4.0f, 9.0f, 1.4f, 2.6f, -3.0f);    // smoke
+    Burst(particles, c, 6, Color{ 255, 220, 120, 255 }, 14.0f, 5.0f, 0.5f, 0.4f, 10.0f);  // sparks
+    e.turretPos = { e.pos.x, 2.25f, e.pos.z };
+    // Strong outward pop: guaranteed to clear the hull (half-diagonal ~2.8
+    // + turret radius 1.35) so the barrel doesn't end up inside the wreck.
+    float popA = (float)GetRandomValue(0, 360) * DEG2RAD;
+    float popS = (float)GetRandomValue(50, 80) / 10.0f;
+    e.turretVel = { cosf(popA) * popS,
+                    (float)GetRandomValue(75, 115) / 10.0f,
+                    sinf(popA) * popS };
+    e.turretSpinVel = (float)GetRandomValue(-9, 9);
+    e.turretLanded = false;
+    e.burnAccum = 0.0f;
+}
+
+static void UpdateEnemies(std::vector<Enemy> &enemies, std::vector<Particle> &particles, float dt) {
+    for (auto &e : enemies) {
+        if (e.hitFlashT > 0.0f) e.hitFlashT -= dt;
+        if (e.alive) continue;
+        e.deathT += dt;
+        // Popped turret: ballistic arc, then rests where it lands.
+        if (!e.turretLanded) {
+            e.turretVel.y -= 22.0f * dt;
+            e.turretPos = Vector3Add(e.turretPos, Vector3Scale(e.turretVel, dt));
+            e.turretSpin += e.turretSpinVel * dt;
+            if (e.turretPos.y <= 0.55f) {
+                e.turretPos.y = 0.55f;
+                // Safety: never rest inside the hull wreck — push out so the
+                // barrel stays visible instead of buried in the hull.
+                float dx = e.turretPos.x - e.pos.x, dz = e.turretPos.z - e.pos.z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 < 4.5f * 4.5f) {
+                    float d = sqrtf(d2);
+                    if (d < 1e-3f) { dx = 1.0f; dz = 0.0f; d = 1.0f; }
+                    e.turretPos.x = e.pos.x + dx / d * 4.5f;
+                    e.turretPos.z = e.pos.z + dz / d * 4.5f;
+                }
+                e.turretLanded = true;
+            }
+        }
+        // Persistent burn: flame flicker + rising smoke wisps.
+        e.burnAccum += dt;
+        if (e.burnAccum >= 0.22f) {
+            e.burnAccum = 0.0f;
+            Vector3 c = { e.pos.x + (float)GetRandomValue(-10, 10) / 10.0f, 1.4f,
+                          e.pos.z + (float)GetRandomValue(-10, 10) / 10.0f };
+            Burst(particles, c, 1, Color{ 255, 130, 30, 255 }, 1.0f, 2.5f, 0.55f, 0.5f, -2.0f);
+            Burst(particles, c, 1, Color{ 70, 66, 60, 255 }, 0.8f, 4.0f, 0.9f, 2.0f, -3.0f);
+        }
+    }
+    // Particles: integrate, gravity, expire.
+    for (auto it = particles.begin(); it != particles.end();) {
+        it->vel.y -= it->grav * dt;
+        it->pos = Vector3Add(it->pos, Vector3Scale(it->vel, dt));
+        it->life -= dt;
+        it = (it->life <= 0.0f) ? particles.erase(it) : std::next(it);
+    }
+}
+
+// Push the player circle out of every wreck (if blocking is enabled).
+static void ResolveWreckCollisions(Vector3 &pos, const std::vector<Enemy> &enemies, bool wreckBlocks) {
+    if (!wreckBlocks) return;
+    for (const auto &e : enemies) {
+        if (e.alive) continue;
+        float dx = pos.x - e.pos.x, dz = pos.z - e.pos.z;
+        float rr = TANK_RADIUS + 2.0f;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < rr * rr && d2 > 1e-6f) {
+            float d = sqrtf(d2);
+            pos.x = e.pos.x + dx / d * rr;
+            pos.z = e.pos.z + dz / d * rr;
+        }
+    }
+}
+
+static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
+    static const Color CHARRED = { 38, 33, 28, 255 };
+    for (const auto &e : enemies) {
+        if (e.alive) {
+            Color armor = cfg.enemyColor;
+            if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
+            DrawTankHull(e.pos, e.hullAngle, armor);
+            DrawTankTurret(Vector3{ e.pos.x, 2.25f, e.pos.z },
+                           e.hullAngle + e.turretAngle, armor);
+        } else {
+            // Burning wreck: charred hull, turret where it landed.
+            DrawTankHull(e.pos, e.hullAngle, CHARRED);
+            DrawTankTurret(e.turretPos, e.turretSpin, CHARRED);
+            // Fire flicker on the hull.
+            float f = 0.75f + 0.25f * sinf(e.deathT * 13.0f);
+            DrawSphere(Vector3{ e.pos.x, 1.7f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
+            DrawSphere(Vector3{ e.pos.x + 0.5f, 1.5f, e.pos.z - 0.3f }, 0.35f * f,
+                       Color{ 255, 190, 60, 190 });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -494,8 +740,10 @@ int main() {
 
     Config cfg = LoadConfig();
     std::vector<Building> village = BuildVillage(cfg.buildingHits);
+    std::vector<Enemy> enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
     std::vector<Shell> shells;
     std::vector<Flash> flashes;
+    std::vector<Particle> particles;
     float fireCooldown = 0.0f;
     Tank tank;
     DroneCam drone;
@@ -534,6 +782,7 @@ int main() {
         tabWasDown = tabDown;
 
         UpdateTank(tank, village, dt, mode == CamMode::GUNNER);
+        ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 
         fireCooldown -= dt;
 
@@ -573,8 +822,20 @@ int main() {
                     }
                 }
             }
+            if (!dead) {
+                for (auto &e : enemies) {
+                    if (ShellHitsEnemy(it->pos, cfg.shellRadius, e)) {
+                        DamageEnemy(e, particles, flashes);
+                        flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                        dead = true;
+                        break;
+                    }
+                }
+            }
             it = dead ? shells.erase(it) : std::next(it);
         }
+
+        UpdateEnemies(enemies, particles, dt);
 
         // Collapse animation progress; impact/muzzle flashes decay.
         for (auto &b : village)
@@ -621,6 +882,7 @@ int main() {
         DrawGrid(40, 20.0f);
         DrawVillage(village);
         DrawTank(tank, mode == CamMode::GUNNER);
+        DrawEnemies(enemies, cfg);
         // Shells and flashes BEFORE the ghost turret: the ghost is translucent
         // but writes depth, so anything drawn after it (and behind its far
         // wall) would be occluded. Opaque first, translucent ghost last.
@@ -638,6 +900,12 @@ int main() {
             float a = f.t / f.maxT;
             DrawSphere(f.pos, f.size * (0.5f + 0.5f * a), Color{ 255, 180, 60, (unsigned char)(255 * a) });
         }
+        // Particles: fading spheres (fire, smoke, sparks).
+        for (const auto &p : particles) {
+            float a = fmaxf(p.life / p.maxLife, 0.0f);
+            DrawSphere(p.pos, p.size * (0.4f + 0.6f * a),
+                       Color{ p.color.r, p.color.g, p.color.b, (unsigned char)(255 * a) });
+        }
         // The ghost turret blends over the world, so it goes last.
         if (mode == CamMode::GUNNER) DrawTurretGhost(tank);
         EndMode3D();
@@ -646,6 +914,9 @@ int main() {
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("TANKSHOOTER v0.2  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
+        int aliveCount = 0;
+        for (const auto &e : enemies) if (e.alive) ++aliveCount;
+        DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
         if (mode == CamMode::GUNNER) {
             // Crosshair
             int cx = screenWidth / 2, cy = screenHeight / 2;

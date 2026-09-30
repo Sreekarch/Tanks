@@ -30,10 +30,20 @@ struct Config {
     float shellRadius      = 0.18f;
     int   buildingHits     = 3;
     float collapseDuration = 1.6f;
+    // Player
+    int   playerHits       = 3;
+    float playerSpeed      = 14.0f;
+    // Enemy
     int   enemyCount       = 4;
     int   enemyHits        = 2;
     bool  wreckBlocks      = true;
     Color enemyColor       = { 165, 70, 50, 255 };
+    float enemySpeed       = 10.0f;
+    float enemyRange       = 70.0f;   // shoot when closer than this + LOS
+    float enemyFireInt     = 3.5f;    // seconds between shots
+    float enemySpread      = 0.06f;   // radians of random aim error
+    float enemyAimTime     = 1.2f;    // tracking (telegraph) before firing
+    float enemyCoverWait   = 4.0f;    // seconds hidden before re-emerging
 };
 
 // Loads Tanks.json from the working directory. Missing file or bad values
@@ -49,15 +59,24 @@ static Config LoadConfig() {
         auto building = j.value("building", nlohmann::json::object());
         auto collapse = j.value("collapse", nlohmann::json::object());
         auto enemy    = j.value("enemy", nlohmann::json::object());
+        auto player   = j.value("player", nlohmann::json::object());
         c.shellSpeed       = shell.value("speed", c.shellSpeed);
         c.shellCooldown    = shell.value("cooldownSeconds", c.shellCooldown);
         c.shellLifetime    = shell.value("lifetimeSeconds", c.shellLifetime);
         c.shellRadius      = shell.value("radius", c.shellRadius);
         c.buildingHits     = building.value("hitsToDestroy", c.buildingHits);
         c.collapseDuration = collapse.value("durationSeconds", c.collapseDuration);
+        c.playerHits       = player.value("hitsToDestroy", c.playerHits);
+        c.playerSpeed      = player.value("speed", c.playerSpeed);
         c.enemyCount       = enemy.value("count", c.enemyCount);
         c.enemyHits        = enemy.value("hitsToDestroy", c.enemyHits);
         c.wreckBlocks      = enemy.value("wreckBlocksMovement", c.wreckBlocks);
+        c.enemySpeed       = enemy.value("speed", c.enemySpeed);
+        c.enemyRange       = enemy.value("shootRange", c.enemyRange);
+        c.enemyFireInt     = enemy.value("fireInterval", c.enemyFireInt);
+        c.enemySpread      = enemy.value("aimSpread", c.enemySpread);
+        c.enemyAimTime     = enemy.value("aimTime", c.enemyAimTime);
+        c.enemyCoverWait   = enemy.value("coverWaitTime", c.enemyCoverWait);
         auto ec = enemy.value("color", nlohmann::json::object());
         c.enemyColor.r = (unsigned char)ec.value("r", (int)c.enemyColor.r);
         c.enemyColor.g = (unsigned char)ec.value("g", (int)c.enemyColor.g);
@@ -286,6 +305,9 @@ struct Tank {
     float turretAngle = 0.0f;  // radians, relative to hull (rendering + stops)
     float aimAngle    = 0.0f;  // radians, world-space gun direction (stabilized sight)
     float speed       = 0.0f;
+    int hp = 3;
+    int maxHp = 3;
+    float hitFlashT = 0.0f;    // red hit feedback timer
 };
 
 static Vector3 TurretWorldPos(const Tank &t) {
@@ -297,7 +319,8 @@ static Vector3 TurretForward(const Tank &t) {
     return Vector3{ sinf(a), 0.0f, -cosf(a) };  // 0 rad faces -Z
 }
 
-static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt, bool allowDrive) {
+static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt,
+                       bool allowDrive, float maxSpeed) {
     float throttle = 0.0f;
     float steer = 0.0f;
     // Driving input only counts in gunner mode; in drone mode the tank
@@ -309,7 +332,7 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt, 
         if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) steer += 1.0f;
     }
 
-    if (throttle > 0.0f)      t.speed = fminf(t.speed + ACCEL * dt, MAX_SPEED);
+    if (throttle > 0.0f)      t.speed = fminf(t.speed + ACCEL * dt, maxSpeed);
     else if (throttle < 0.0f) t.speed = fmaxf(t.speed - ACCEL * dt, MAX_REVERSE);
     else {
         // Engine braking.
@@ -318,7 +341,7 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt, 
     }
 
     // Tanks can pivot in place; scale a little with speed for feel.
-    float turnAuthority = 0.55f + 0.45f * fminf(fabsf(t.speed) / MAX_SPEED, 1.0f);
+    float turnAuthority = 0.55f + 0.45f * fminf(fabsf(t.speed) / maxSpeed, 1.0f);
     t.hullAngle += steer * TURN_RATE * turnAuthority * dt * (t.speed < 0.0f ? -1.0f : 1.0f);
 
     Vector3 fwd = { sinf(t.hullAngle), 0.0f, -cosf(t.hullAngle) };
@@ -326,6 +349,7 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt, 
     t.pos.z += fwd.z * t.speed * dt;
 
     ResolveBuildingCollisions(t.pos, village);
+    if (t.hitFlashT > 0.0f) t.hitFlashT -= dt;
 }
 
 // Hull mesh shared by the player and enemies. armor is the base color;
@@ -472,6 +496,7 @@ struct Shell {
     Vector3 pos;
     Vector3 vel;
     float life;
+    bool fromEnemy = false;  // true: hostile shell, hits the player
     static constexpr int TRAIL = 24;
     Vector3 trail[TRAIL];
     int trailCount = 0;
@@ -496,7 +521,10 @@ struct Particle {
     float grav;   // vertical accel; negative rises (smoke), positive falls
 };
 
-// Enemy tank: stationary in v0.4 (movement + shooting AI arrives in v0.5).
+// Enemy tank AI states (v0.5).
+enum class AIState { ADVANCE, SHOOT, SEEK_COVER, COVER_WAIT };
+
+// Enemy tank: AI-driven in v0.5 (advance / shoot / seek-cover).
 // On death the turret pops off ballistically and the hull becomes a
 // persistent burning wreck.
 struct Enemy {
@@ -507,6 +535,12 @@ struct Enemy {
     int maxHp = 2;
     bool alive = true;
     float hitFlashT = 0.0f;   // white hit feedback timer
+    // AI state.
+    AIState aiState = AIState::ADVANCE;
+    float aiTimer = 0.0f;       // time in current state
+    Vector3 coverPos = { 0, 0, 0 };
+    float fireTimer = 0.0f;     // time since last shot
+    float aimTimer = 0.0f;      // lock-on tracking time (telegraph)
     // Death animation state.
     float deathT = 0.0f;
     Vector3 turretPos;        // detached turret world position
@@ -544,6 +578,150 @@ static bool ShellHitsBuilding(const Vector3 &p, float r, const Building &b) {
     float cz = Clamp(p.z, b.center.z - hz, b.center.z + hz);
     float dx = p.x - cx, dy = p.y - cy, dz = p.z - cz;
     return (dx * dx + dy * dy + dz * dz) < r * r;
+}
+
+// Does the segment A->B hit any standing building? For AI line-of-sight.
+static bool LosBlocked(const Vector3 &a, const Vector3 &b, const std::vector<Building> &village) {
+    Vector3 d = Vector3Subtract(b, a);
+    for (const auto &bd : village) {
+        if (bd.destroyed) continue;
+        float tmin = 0.0f, tmax = 1.0f;
+        Vector3 mn = { bd.center.x - bd.size.x * 0.5f, 0.0f, bd.center.z - bd.size.z * 0.5f };
+        Vector3 mx = { bd.center.x + bd.size.x * 0.5f, bd.size.y, bd.center.z + bd.size.z * 0.5f };
+        const float o[3] = { a.x, a.y, a.z }, dd[3] = { d.x, d.y, d.z };
+        const float n[3] = { mn.x, mn.y, mn.z }, x[3] = { mx.x, mx.y, mx.z };
+        bool hit = true;
+        for (int i = 0; i < 3; ++i) {
+            if (fabsf(dd[i]) < 1e-8f) {
+                if (o[i] < n[i] || o[i] > x[i]) { hit = false; break; }
+            } else {
+                float t1 = (n[i] - o[i]) / dd[i], t2 = (x[i] - o[i]) / dd[i];
+                if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+                tmin = fmaxf(tmin, t1); tmax = fminf(tmax, t2);
+                if (tmin > tmax) { hit = false; break; }
+            }
+        }
+        if (hit) return true;
+    }
+    return false;
+}
+
+// Nearest building between the enemy and the player; returns a spot on the
+// far side to hide behind. Falls back to the enemy's position (no cover).
+static Vector3 PickCover(const Enemy &e, const Vector3 &playerPos,
+                         const std::vector<Building> &village) {
+    Vector3 best = e.pos;
+    float bestD2 = 1e18f;
+    for (const auto &b : village) {
+        if (b.destroyed) continue;
+        float ex = playerPos.x - e.pos.x, ez = playerPos.z - e.pos.z;
+        float elen2 = ex * ex + ez * ez;
+        if (elen2 < 1e-3f) continue;
+        float bx = b.center.x - e.pos.x, bz = b.center.z - e.pos.z;
+        float t = (bx * ex + bz * ez) / elen2;  // 0=enemy, 1=player
+        if (t < 0.15f || t > 0.85f) continue;
+        float px = bx - ex * t, pz = bz - ez * t;
+        float bRad = fmaxf(b.size.x, b.size.z) * 0.5f;
+        if (px * px + pz * pz > (bRad + 3.0f) * (bRad + 3.0f)) continue;
+        float ax = b.center.x - playerPos.x, az = b.center.z - playerPos.z;
+        float alen = sqrtf(ax * ax + az * az);
+        if (alen < 1e-3f) continue;
+        Vector3 spot = { b.center.x + ax / alen * (bRad + 5.0f), 0.0f,
+                         b.center.z + az / alen * (bRad + 5.0f) };
+        float sx = spot.x - e.pos.x, sz = spot.z - e.pos.z;
+        float d2 = sx * sx + sz * sz;
+        if (d2 < bestD2) { bestD2 = d2; best = spot; }
+    }
+    return best;
+}
+
+static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Building> &village,
+                          std::vector<Shell> &shells, std::vector<Flash> &flashes,
+                          const Config &cfg, float dt) {
+    if (!e.alive) return;
+    e.aiTimer += dt;
+    e.fireTimer += dt;
+    if (e.hitFlashT > 0.0f) e.hitFlashT -= dt;
+
+    float dx = player.pos.x - e.pos.x, dz = player.pos.z - e.pos.z;
+    float dist = sqrtf(dx * dx + dz * dz);
+    Vector3 eye = { e.pos.x, 2.25f, e.pos.z };
+    Vector3 tgt = { player.pos.x, 2.0f, player.pos.z };
+    bool los = !LosBlocked(eye, tgt, village);
+    bool inRange = dist < cfg.enemyRange;
+
+    auto driveToward = [&](float wantAngle, float speed) {
+        float diff = NormalizeAngle(wantAngle - e.hullAngle);
+        e.hullAngle += Clamp(diff * 3.0f, -1.6f, 1.6f) * dt;
+        float throttle = (fabsf(diff) < 0.6f) ? 1.0f : 0.25f;
+        e.pos.x += sinf(e.hullAngle) * speed * throttle * dt;
+        e.pos.z += -cosf(e.hullAngle) * speed * throttle * dt;
+    };
+
+    switch (e.aiState) {
+    case AIState::ADVANCE: {
+        float want = atan2f(dx, -dz);
+        float throttleScale = (los && inRange && dist < cfg.enemyRange * 0.7f) ? 0.0f : 1.0f;
+        if (throttleScale > 0.0f) driveToward(want, cfg.enemySpeed);
+        // Turret relaxes toward hull-forward when not engaged.
+        e.turretAngle = NormalizeAngle(e.turretAngle - e.turretAngle * fminf(dt * 2.0f, 1.0f));
+        if (los && inRange) {
+            e.aiState = AIState::SHOOT;
+            e.aiTimer = 0.0f;
+            e.aimTimer = 0.0f;
+        }
+        break;
+    }
+    case AIState::SHOOT: {
+        // Turret visibly tracks the player — the telegraph.
+        float wantWorld = atan2f(dx, -dz);
+        float wantTurret = NormalizeAngle(wantWorld - e.hullAngle);
+        float tdiff = NormalizeAngle(wantTurret - e.turretAngle);
+        e.turretAngle += Clamp(tdiff * 4.0f, -2.5f, 2.5f) * dt;
+        if (los && inRange) {
+            e.aimTimer += dt;
+            if (e.aimTimer >= cfg.enemyAimTime && e.fireTimer >= cfg.enemyFireInt) {
+                float spread = ((float)GetRandomValue(-100, 100) / 100.0f) * cfg.enemySpread;
+                float fa = e.hullAngle + e.turretAngle + spread;
+                Vector3 fwd = { sinf(fa), 0.0f, -cosf(fa) };
+                Vector3 muzzle = { e.pos.x + fwd.x * 3.55f, 2.25f, e.pos.z + fwd.z * 3.55f };
+                Shell s;
+                s.pos = muzzle;
+                s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+                s.life = cfg.shellLifetime;
+                s.fromEnemy = true;
+                shells.push_back(s);
+                flashes.push_back(Flash{ muzzle, 0.22f, 0.22f, 0.9f });
+                e.fireTimer = 0.0f;
+                e.aimTimer = 0.0f;
+            }
+        } else {
+            e.aimTimer = 0.0f;  // lost the lock
+            e.aiState = AIState::ADVANCE;
+            e.aiTimer = 0.0f;
+        }
+        break;
+    }
+    case AIState::SEEK_COVER: {
+        float cdx = e.coverPos.x - e.pos.x, cdz = e.coverPos.z - e.pos.z;
+        if (cdx * cdx + cdz * cdz < 9.0f) {
+            e.aiState = AIState::COVER_WAIT;
+            e.aiTimer = 0.0f;
+        } else {
+            driveToward(atan2f(cdx, -cdz), cfg.enemySpeed);
+        }
+        break;
+    }
+    case AIState::COVER_WAIT: {
+        if (e.aiTimer >= cfg.enemyCoverWait) {
+            e.aiState = AIState::ADVANCE;
+            e.aiTimer = 0.0f;
+        }
+        break;
+    }
+    }
+
+    ResolveBuildingCollisions(e.pos, village);
 }
 
 static void DamageBuilding(Building &b, const Vector3 &hitPos) {
@@ -622,10 +800,18 @@ static void Burst(std::vector<Particle> &ps, Vector3 c, int n,
 }
 
 static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
-                        std::vector<Flash> &flashes) {
+                        std::vector<Flash> &flashes, const Vector3 &playerPos,
+                        const std::vector<Building> &village) {
     if (!e.alive) return;
     e.hitFlashT = 0.18f;
-    if (--e.hp > 0) return;
+    if (--e.hp > 0) {
+        // Nonlethal hit: break off and seek cover behind a building.
+        e.coverPos = PickCover(e, playerPos, village);
+        e.aiState = AIState::SEEK_COVER;
+        e.aiTimer = 0.0f;
+        e.aimTimer = 0.0f;
+        return;
+    }
     // Kill: fireball flash, flame + smoke burst, turret pops off.
     e.alive = false;
     e.deathT = 0.0f;
@@ -716,6 +902,12 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
             DrawTankHull(e.pos, e.hullAngle, armor);
             DrawTankTurret(Vector3{ e.pos.x, 2.25f, e.pos.z },
                            e.hullAngle + e.turretAngle, armor);
+            // Tracking ping: pulsing red ring under an enemy with a lock.
+            if (e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) {
+                float pulse = 2.8f + sinf(e.aimTimer * 14.0f) * 0.5f;
+                DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z },
+                                  pulse, pulse, 0.12f, 24, Color{ 255, 40, 40, 230 });
+            }
         } else {
             // Burning wreck: charred hull, turret where it landed.
             DrawTankHull(e.pos, e.hullAngle, CHARRED);
@@ -734,7 +926,7 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
 // ---------------------------------------------------------------------------
 int main() {
     const int screenWidth = 1280, screenHeight = 720;
-    InitWindow(screenWidth, screenHeight, "Tankshooter v0.1");
+    InitWindow(screenWidth, screenHeight, "Tankshooter v0.5");
     SetTargetFPS(60);
     DisableCursor();
 
@@ -746,8 +938,10 @@ int main() {
     std::vector<Particle> particles;
     float fireCooldown = 0.0f;
     Tank tank;
+    tank.hp = tank.maxHp = cfg.playerHits;
     DroneCam drone;
     CamMode mode = CamMode::GUNNER;
+    bool gameOver = false;
     Camera3D camera = {};
     camera.position = Vector3{ 0.0f, 10.0f, 10.0f };
     camera.target = Vector3{ 0.0f, 0.0f, 0.0f };
@@ -760,6 +954,22 @@ int main() {
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
+
+        int aliveNow = 0;
+        for (const auto &e : enemies) if (e.alive) ++aliveNow;
+        if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
+            // Restart: fresh village, enemies, player.
+            tank = Tank{};
+            tank.hp = tank.maxHp = cfg.playerHits;
+            village = BuildVillage(cfg.buildingHits);
+            enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
+            shells.clear(); flashes.clear(); particles.clear();
+            fireCooldown = 0.0f;
+            mode = CamMode::GUNNER;
+            gameOver = false;
+        }
+
+        if (!gameOver) {
 
         // Read the mouse once per frame. Deltas from the first few frames are
         // discarded: hiding/capturing the cursor can warp the pointer and
@@ -781,7 +991,7 @@ int main() {
         }
         tabWasDown = tabDown;
 
-        UpdateTank(tank, village, dt, mode == CamMode::GUNNER);
+        UpdateTank(tank, village, dt, mode == CamMode::GUNNER, cfg.playerSpeed);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 
         fireCooldown -= dt;
@@ -823,19 +1033,52 @@ int main() {
                 }
             }
             if (!dead) {
-                for (auto &e : enemies) {
-                    if (ShellHitsEnemy(it->pos, cfg.shellRadius, e)) {
-                        DamageEnemy(e, particles, flashes);
-                        flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                if (it->fromEnemy) {
+                    // Hostile shell: hits the player.
+                    float pdx = it->pos.x - tank.pos.x, pdz = it->pos.z - tank.pos.z;
+                    float prr = 2.2f + cfg.shellRadius;
+                    if (pdx * pdx + pdz * pdz < prr * prr && it->pos.y > 0.0f && it->pos.y < 3.2f) {
+                        tank.hp--;
+                        tank.hitFlashT = 0.4f;
+                        Vector3 hc = { tank.pos.x, 1.6f, tank.pos.z };
+                        flashes.push_back(Flash{ hc, 0.4f, 0.4f, 2.5f });
+                        Burst(particles, hc, 8, Color{ 255, 150, 40, 255 }, 7.0f, 6.0f, 0.7f, 0.6f, 6.0f);
+                        if (tank.hp <= 0) gameOver = true;
                         dead = true;
-                        break;
+                    }
+                } else {
+                    for (auto &e : enemies) {
+                        if (ShellHitsEnemy(it->pos, cfg.shellRadius, e)) {
+                            DamageEnemy(e, particles, flashes, tank.pos, village);
+                            flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                            dead = true;
+                            break;
+                        }
                     }
                 }
             }
             it = dead ? shells.erase(it) : std::next(it);
         }
 
+        // Enemy AI (advance / shoot / seek-cover) + death animations.
+        for (auto &e : enemies)
+            UpdateEnemyAI(e, tank, village, shells, flashes, cfg, dt);
         UpdateEnemies(enemies, particles, dt);
+        // Wrecks block enemies too; enemies keep separation from each other.
+        for (auto &e : enemies) {
+            if (!e.alive) continue;
+            ResolveWreckCollisions(e.pos, enemies, cfg.wreckBlocks);
+            for (auto &o : enemies) {
+                if (&o == &e || !o.alive) continue;
+                float sx = e.pos.x - o.pos.x, sz = e.pos.z - o.pos.z;
+                float d2 = sx * sx + sz * sz;
+                if (d2 < 25.0f && d2 > 1e-4f) {
+                    float d = sqrtf(d2);
+                    e.pos.x = o.pos.x + sx / d * 5.0f;
+                    e.pos.z = o.pos.z + sz / d * 5.0f;
+                }
+            }
+        }
 
         // Collapse animation progress; impact/muzzle flashes decay.
         for (auto &b : village)
@@ -871,6 +1114,7 @@ int main() {
             camera.position = drone.pos;
             camera.target = Vector3Add(drone.pos, fwd);
         }
+        }  // end if (!gameOver)
 
         BeginDrawing();
         ClearBackground(SKYBLUE);
@@ -912,11 +1156,36 @@ int main() {
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
-        DrawText(TextFormat("TANKSHOOTER v0.2  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
+        DrawText(TextFormat("TANKSHOOTER v0.5  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
         DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
+        DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 90, 20,
+                 tank.hp > 1 ? DARKGREEN : RED);
+        // Tracking ping: any enemy with an active lock?
+        bool tracked = false;
+        for (const auto &e : enemies)
+            if (e.alive && e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) { tracked = true; break; }
+        if (tracked && !gameOver && (frameCount / 20) % 2 == 0) {
+            DrawText("!! TRACKED !!", screenWidth / 2 - 90, 70, 28, RED);
+        }
+        // Red edge flash on player hit.
+        if (tank.hitFlashT > 0.0f) {
+            float a = fminf(tank.hitFlashT / 0.4f, 1.0f);
+            DrawRectangle(0, 0, screenWidth, 10, Color{ 255, 0, 0, (unsigned char)(a * 200) });
+            DrawRectangle(0, screenHeight - 10, screenWidth, 10, Color{ 255, 0, 0, (unsigned char)(a * 200) });
+            DrawRectangle(0, 0, 10, screenHeight, Color{ 255, 0, 0, (unsigned char)(a * 200) });
+            DrawRectangle(screenWidth - 10, 0, 10, screenHeight, Color{ 255, 0, 0, (unsigned char)(a * 200) });
+        }
+        if (gameOver) {
+            DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
+            DrawText("YOU DIED", screenWidth / 2 - 110, screenHeight / 2 - 40, 48, RED);
+            DrawText("Press R to restart", screenWidth / 2 - 110, screenHeight / 2 + 20, 24, WHITE);
+        } else if (aliveCount == 0) {
+            DrawText("Arena Cleared!", screenWidth / 2 - 110, 110, 32, DARKGREEN);
+            DrawText("Press R to restart", screenWidth / 2 - 110, 150, 22, DARKGRAY);
+        }
         if (mode == CamMode::GUNNER) {
             // Crosshair
             int cx = screenWidth / 2, cy = screenHeight / 2;

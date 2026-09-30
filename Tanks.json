@@ -1,3 +1,1 @@
-{"building":{"hitsToDestroy":3},"collapse":{"durationSeconds":1.6},
- "enemy":{"color":{"b":50,"g":70,"r":165},"count":4,"hitsToDestroy":2,"wreckBlocksMovement":true},
- "shell":{"cooldownSeconds":1.5,"lifetimeSeconds":4.0,"radius":0.18,"speed":70.0}}
+{"building":{"hitsToDestroy":3},"collapse":{"durationSeconds":1.6},"enemy":{"aimSpread":0.06,"aimTime":1.2,"color":{"b":50,"g":70,"r":165},"count":4,"coverWaitTime":4.0,"fireInterval":3.5,"hitsToDestroy":2,"shootRange":70.0,"speed":10.0,"wreckBlocksMovement":true},"player":{"hitsToDestroy":3,"speed":14.0},"shell":{"cooldownSeconds":1.5,"lifetimeSeconds":4.0,"radius":0.18,"speed":70.0}}

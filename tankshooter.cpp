@@ -494,19 +494,22 @@ struct DroneCam {
     float pitch = -0.5f;  // radians, negative looks down
 };
 
-static void UpdateDrone(DroneCam &d, Vector2 md, float dt) {
-    d.yaw   += md.x * 0.003f;   // mouse right = look right
-    d.pitch  = Clamp(d.pitch - md.y * 0.003f, -1.45f, 1.45f);
+static void UpdateDrone(DroneCam &d, float dt) {
+    // Arrow keys rotate the view (mouse is a free cursor for orders).
+    if (IsKeyDown(KEY_LEFT))  d.yaw   -= 1.5f * dt;
+    if (IsKeyDown(KEY_RIGHT)) d.yaw   += 1.5f * dt;
+    if (IsKeyDown(KEY_UP))    d.pitch = Clamp(d.pitch - 1.0f * dt, -1.45f, 1.45f);
+    if (IsKeyDown(KEY_DOWN))  d.pitch = Clamp(d.pitch + 1.0f * dt, -1.45f, 1.45f);
 
     Vector3 fwd = { sinf(d.yaw) * cosf(d.pitch), sinf(d.pitch), -cosf(d.yaw) * cosf(d.pitch) };
     Vector3 right = { -fwd.z, 0.0f, fwd.x };
     right = Vector3Normalize(right);
 
     float sp = 40.0f * (IsKeyDown(KEY_LEFT_SHIFT) ? 2.5f : 1.0f);
-    if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP))    d.pos = Vector3Add(d.pos, Vector3Scale(fwd, sp * dt));
-    if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN))  d.pos = Vector3Subtract(d.pos, Vector3Scale(fwd, sp * dt));
-    if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT))  d.pos = Vector3Subtract(d.pos, Vector3Scale(right, sp * dt));
-    if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) d.pos = Vector3Add(d.pos, Vector3Scale(right, sp * dt));
+    if (IsKeyDown(KEY_W))    d.pos = Vector3Add(d.pos, Vector3Scale(fwd, sp * dt));
+    if (IsKeyDown(KEY_S))    d.pos = Vector3Subtract(d.pos, Vector3Scale(fwd, sp * dt));
+    if (IsKeyDown(KEY_A))    d.pos = Vector3Subtract(d.pos, Vector3Scale(right, sp * dt));
+    if (IsKeyDown(KEY_D))    d.pos = Vector3Add(d.pos, Vector3Scale(right, sp * dt));
     if (IsKeyDown(KEY_Q)) d.pos.y -= sp * dt;
     if (IsKeyDown(KEY_E)) d.pos.y += sp * dt;
     d.pos.y = Clamp(d.pos.y, 2.0f, 150.0f);
@@ -530,6 +533,14 @@ struct Flash {
     float t;      // time remaining
     float maxT;   // total duration
     float size;
+};
+
+// Expanding ring ping shown where an order was issued (drone mode).
+struct OrderPing {
+    Vector3 pos;
+    float t;
+    float maxT;
+    Color color;
 };
 
 // Lightweight particle for explosions, smoke, and fire. No pooling —
@@ -1189,8 +1200,15 @@ static void DrawAllies(const std::vector<Ally> &allies, const std::vector<Enemy>
             }
             // Objective marker.
             if (a.order == AllyOrder::MOVE) {
+                // Light pillar + pulsing ring + line from the ally.
+                DrawCylinder(Vector3{ a.orderPos.x, 5.0f, a.orderPos.z },
+                             0.3f, 0.3f, 10.0f, 12, Color{ 80, 160, 255, 90 });
+                float pulse = 1.5f + sinf((float)GetTime() * 5.0f) * 0.3f;
                 DrawCylinderWires(Vector3{ a.orderPos.x, 0.08f, a.orderPos.z },
-                                  1.5f, 1.5f, 0.12f, 16, Color{ 80, 160, 255, 230 });
+                                  pulse, pulse, 0.12f, 16, Color{ 80, 160, 255, 230 });
+                DrawLine3D(Vector3{ a.pos.x, 0.5f, a.pos.z },
+                           Vector3{ a.orderPos.x, 0.5f, a.orderPos.z },
+                           Color{ 80, 160, 255, 150 });
             } else if (a.order == AllyOrder::ATTACK && a.targetEnemy >= 0 &&
                        a.targetEnemy < (int)enemies.size() && enemies[a.targetEnemy].alive) {
                 const auto &e = enemies[a.targetEnemy];
@@ -1224,9 +1242,11 @@ int main() {
     int selectedAlly = 0;
     std::vector<Shell> shells;
     std::vector<Flash> flashes;
+    std::vector<OrderPing> pings;
     std::vector<Particle> particles;
     float fireCooldown = 0.0f;
     DroneCam drone;
+    Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     CamMode mode = CamMode::GUNNER;
     bool gameOver = false;
     Camera3D camera = {};
@@ -1242,6 +1262,10 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
 
+        // Mouse ground point (drone mode), for the cursor + order raycast.
+        Vector3 mouseGround = { 0, 0, 0 };
+        bool mouseGroundValid = false;
+
         int aliveNow = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveNow;
         if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
@@ -1252,7 +1276,7 @@ int main() {
             enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
             allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
             selectedAlly = 0;
-            shells.clear(); flashes.clear(); particles.clear();
+            shells.clear(); flashes.clear(); particles.clear(); pings.clear();
             fireCooldown = 0.0f;
             mode = CamMode::GUNNER;
             gameOver = false;
@@ -1276,12 +1300,19 @@ int main() {
                 drone.pos = Vector3{ tank.pos.x, 35.0f, tank.pos.z + 25.0f };
                 drone.yaw = tank.hullAngle;
                 drone.pitch = -0.6f;
+                // Drone mode needs a visible cursor for click-to-order;
+                // gunner mode uses relative mouse-look.
+                EnableCursor();
+            } else {
+                DisableCursor();
             }
         }
         tabWasDown = tabDown;
 
         // Ally orders (drone mode only): 1..N select, right-click ground =
         // move, right-click enemy = attack, F = follow, H = hold.
+        // (Mouse ground point + right-click are handled after the camera
+        // update below, so the ray uses the current frame's camera.)
         if (mode == CamMode::DRONE && !allies.empty()) {
             for (size_t i = 0; i < allies.size() && i < 9; ++i) {
                 if (IsKeyPressed(KEY_ONE + (int)i)) selectedAlly = (int)i;
@@ -1295,35 +1326,6 @@ int main() {
             if (IsKeyPressed(KEY_H) && sel.alive) {
                 sel.order = AllyOrder::HOLD;
                 sel.targetEnemy = -1;
-            }
-            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && sel.alive) {
-                // Raycast to the ground plane.
-                Ray ray = GetScreenToWorldRay(GetMousePosition(), camera);
-                if (fabsf(ray.direction.y) > 1e-4f) {
-                    float t = -ray.position.y / ray.direction.y;
-                    if (t > 0.0f) {
-                        Vector3 gp = { ray.position.x + ray.direction.x * t, 0.0f,
-                                       ray.position.z + ray.direction.z * t };
-                        // Enemy under the cursor? Attack it. Else move there.
-                        int hitEnemy = -1;
-                        for (size_t ei = 0; ei < enemies.size(); ++ei) {
-                            if (!enemies[ei].alive) continue;
-                            float dx = gp.x - enemies[ei].pos.x, dz = gp.z - enemies[ei].pos.z;
-                            if (dx * dx + dz * dz < 16.0f) { hitEnemy = (int)ei; break; }
-                        }
-                        if (hitEnemy >= 0) {
-                            sel.order = AllyOrder::ATTACK;
-                            sel.targetEnemy = hitEnemy;
-                        } else {
-                            // Clamp inside the arena.
-                            gp.x = Clamp(gp.x, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
-                            gp.z = Clamp(gp.z, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
-                            sel.order = AllyOrder::MOVE;
-                            sel.orderPos = gp;
-                            sel.targetEnemy = -1;
-                        }
-                    }
-                }
             }
         }
 
@@ -1448,6 +1450,10 @@ int main() {
             it->t -= dt;
             it = (it->t <= 0.0f) ? flashes.erase(it) : std::next(it);
         }
+        for (auto it = pings.begin(); it != pings.end();) {
+            it->t -= dt;
+            it = (it->t <= 0.0f) ? pings.erase(it) : std::next(it);
+        }
 
         if (mode == CamMode::GUNNER) {
             // Stabilized gunner sight: the mouse sets a WORLD-space aim
@@ -1468,11 +1474,64 @@ int main() {
             camera.position = Vector3{ tp.x, tp.y + 0.65f, tp.z };
             camera.target   = Vector3{ tp.x + af.x * 60.0f, tp.y + 0.65f, tp.z + af.z * 60.0f };
         } else {
-            UpdateDrone(drone, md, dt);
+            UpdateDrone(drone, dt);
             Vector3 fwd = { sinf(drone.yaw) * cosf(drone.pitch), sinf(drone.pitch),
                             -cosf(drone.yaw) * cosf(drone.pitch) };
             camera.position = drone.pos;
             camera.target = Vector3Add(drone.pos, fwd);
+        }
+
+        // Mouse ground point + right-click orders, using the current camera.
+        // The ray must hit the ground in front of the camera within a sane
+        // distance; otherwise the cursor hides and clicks are ignored.
+        // Drone mode uses a virtual cursor (system cursor is disabled for
+        // gunner mouse-look), driven by mouse deltas and clamped to screen.
+        if (mode == CamMode::DRONE) {
+            Vector2 mdv = GetMouseDelta();
+            droneCursor.x = Clamp(droneCursor.x + mdv.x, 0.0f, (float)screenWidth);
+            droneCursor.y = Clamp(droneCursor.y + mdv.y, 0.0f, (float)screenHeight);
+            Ray ray = GetScreenToWorldRay(droneCursor, camera);
+            if (fabsf(ray.direction.y) > 1e-4f) {
+                float t = -ray.position.y / ray.direction.y;
+                if (t > 0.0f && t < 250.0f) {
+                    Vector3 gp = { ray.position.x + ray.direction.x * t, 0.0f,
+                                   ray.position.z + ray.direction.z * t };
+                    Vector3 cfwd = Vector3Normalize(
+                        Vector3Subtract(camera.target, camera.position));
+                    Vector3 toGp = Vector3Subtract(gp, camera.position);
+                    if (Vector3DotProduct(toGp, cfwd) > 0.0f) {
+                        gp.x = Clamp(gp.x, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
+                        gp.z = Clamp(gp.z, -ARENA_HALF + 5.0f, ARENA_HALF - 5.0f);
+                        mouseGround = gp;
+                        mouseGroundValid = true;
+                    }
+                }
+            }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && mouseGroundValid &&
+                !allies.empty() && selectedAlly < (int)allies.size()) {
+                Ally &sel = allies[selectedAlly];
+                if (sel.alive) {
+                    Vector3 gp = mouseGround;
+                    int hitEnemy = -1;
+                    for (size_t ei = 0; ei < enemies.size(); ++ei) {
+                        if (!enemies[ei].alive) continue;
+                        float dx = gp.x - enemies[ei].pos.x, dz = gp.z - enemies[ei].pos.z;
+                        if (dx * dx + dz * dz < 16.0f) { hitEnemy = (int)ei; break; }
+                    }
+                    if (hitEnemy >= 0) {
+                        sel.order = AllyOrder::ATTACK;
+                        sel.targetEnemy = hitEnemy;
+                        pings.push_back(OrderPing{ enemies[hitEnemy].pos, 0.6f, 0.6f,
+                                                  Color{ 255, 80, 80, 255 } });
+                    } else {
+                        sel.order = AllyOrder::MOVE;
+                        sel.orderPos = gp;
+                        sel.targetEnemy = -1;
+                        pings.push_back(OrderPing{ gp, 0.6f, 0.6f,
+                                                  Color{ 80, 160, 255, 255 } });
+                    }
+                }
+            }
         }
         }  // end if (!gameOver)
 
@@ -1488,6 +1547,25 @@ int main() {
         DrawTank(tank, mode == CamMode::GUNNER);
         DrawEnemies(enemies, cfg);
         DrawAllies(allies, enemies, cfg, selectedAlly);
+        // Drone-mode mouse cursor: ring + crosshair on the ground.
+        if (mode == CamMode::DRONE && mouseGroundValid) {
+            DrawCylinderWires(Vector3{ mouseGround.x, 0.08f, mouseGround.z },
+                              1.0f, 1.0f, 0.1f, 20, Color{ 255, 255, 255, 200 });
+            DrawLine3D(Vector3{ mouseGround.x - 1.8f, 0.08f, mouseGround.z },
+                       Vector3{ mouseGround.x + 1.8f, 0.08f, mouseGround.z },
+                       Color{ 255, 255, 255, 200 });
+            DrawLine3D(Vector3{ mouseGround.x, 0.08f, mouseGround.z - 1.8f },
+                       Vector3{ mouseGround.x, 0.08f, mouseGround.z + 1.8f },
+                       Color{ 255, 255, 255, 200 });
+        }
+        // Order pings: expanding rings where orders were issued.
+        for (const auto &p : pings) {
+            float k = 1.0f - p.t / p.maxT;  // 0 -> 1
+            float r = 1.0f + k * 4.0f;
+            Color c = p.color;
+            c.a = (unsigned char)(255 * (1.0f - k));
+            DrawCylinderWires(Vector3{ p.pos.x, 0.1f, p.pos.z }, r, r, 0.15f, 24, c);
+        }
         // Shells and flashes BEFORE the ghost turret: the ghost is translucent
         // but writes depth, so anything drawn after it (and behind its far
         // wall) would be occluded. Opaque first, translucent ghost last.
@@ -1519,6 +1597,13 @@ int main() {
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("TANKSHOOTER v0.6  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
+        if (mode == CamMode::DRONE) {
+            // Virtual cursor crosshair.
+            float cx = droneCursor.x, cy = droneCursor.y;
+            DrawLine((int)cx - 12, (int)cy, (int)cx + 12, (int)cy, WHITE);
+            DrawLine((int)cx, (int)cy - 12, (int)cx, (int)cy + 12, WHITE);
+            DrawCircleLines((int)cx, (int)cy, 6.0f, WHITE);
+        }
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
         DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
@@ -1541,6 +1626,7 @@ int main() {
         if (mode == CamMode::DRONE) {
             int y0 = 116 + (int)allies.size() * 22 + 6;
             DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
+            DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
         }
         // Tracking ping: any enemy with an active lock?
         bool tracked = false;

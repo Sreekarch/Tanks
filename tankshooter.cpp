@@ -488,6 +488,9 @@ static void DrawTurretGhost(const Tank &t) {
 // ---------------------------------------------------------------------------
 enum class CamMode { GUNNER, DRONE };
 
+// Game phase: SETUP (position forces, enemies hidden) -> COMBAT.
+enum class Phase { SETUP, COMBAT };
+
 struct DroneCam {
     Vector3 pos   = { -ARENA_HALF + 30.0f, 40.0f, ARENA_HALF + 20.0f };
     float yaw   = 0.0f;   // radians, 0 = looking -Z
@@ -951,7 +954,8 @@ static void DamageAlly(Ally &a, std::vector<Particle> &particles, std::vector<Fl
 static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
                          std::vector<Enemy> &enemies, const std::vector<Building> &village,
                          std::vector<Shell> &shells, std::vector<Flash> &flashes,
-                         std::vector<Particle> &particles, const Config &cfg, float dt) {
+                         std::vector<Particle> &particles, const Config &cfg,
+                         bool inCombat, float dt) {
     for (size_t ai = 0; ai < allies.size(); ++ai) {
         Ally &a = allies[ai];
         if (!a.alive) {
@@ -962,11 +966,12 @@ static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
         a.fireTimer += dt;
 
         // Pick a target: explicit ATTACK order, else nearest visible in range.
+        // No engagement during SETUP (enemies are hidden).
         int tgt = -1;
         if (a.order == AllyOrder::ATTACK && a.targetEnemy >= 0 &&
             a.targetEnemy < (int)enemies.size() && enemies[a.targetEnemy].alive) {
             tgt = a.targetEnemy;
-        } else if (cfg.allyEngage) {
+        } else if (inCombat && cfg.allyEngage) {
             float bestD2 = cfg.allyRange * cfg.allyRange;
             Vector3 eye = { a.pos.x, 2.25f, a.pos.z };
             for (size_t ei = 0; ei < enemies.size(); ++ei) {
@@ -1248,6 +1253,7 @@ int main() {
     DroneCam drone;
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     CamMode mode = CamMode::GUNNER;
+    Phase phase = Phase::SETUP;
     bool gameOver = false;
     Camera3D camera = {};
     camera.position = Vector3{ 0.0f, 10.0f, 10.0f };
@@ -1269,7 +1275,7 @@ int main() {
         int aliveNow = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveNow;
         if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
-            // Restart: fresh village, enemies, allies, player.
+            // Restart: fresh village, enemies, allies, player. Back to SETUP.
             tank = Tank{};
             tank.hp = tank.maxHp = cfg.playerHits;
             village = BuildVillage(cfg.buildingHits);
@@ -1279,7 +1285,13 @@ int main() {
             shells.clear(); flashes.clear(); particles.clear(); pings.clear();
             fireCooldown = 0.0f;
             mode = CamMode::GUNNER;
+            phase = Phase::SETUP;
             gameOver = false;
+        }
+
+        // ENTER starts the battle from the setup phase.
+        if (phase == Phase::SETUP && IsKeyPressed(KEY_ENTER)) {
+            phase = Phase::COMBAT;
         }
 
         if (!gameOver) {
@@ -1338,7 +1350,7 @@ int main() {
         // in drone mode the turret fires along its current aim, so you can
         // watch the shells from outside.
         if ((IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsKeyDown(KEY_SPACE)) &&
-            fireCooldown <= 0.0f) {
+            fireCooldown <= 0.0f && phase == Phase::COMBAT) {
             FireShell(tank, shells, cfg);
             fireCooldown = cfg.shellCooldown;
             Vector3 muzzle = MuzzleWorldPos(tank);
@@ -1410,11 +1422,16 @@ int main() {
         }
 
         // Enemy AI (advance / shoot / seek-cover) + death animations.
-        for (auto &e : enemies)
-            UpdateEnemyAI(e, tank, village, shells, flashes, cfg, dt);
+        // Hidden and inert during SETUP: they spawn when combat begins.
+        if (phase == Phase::COMBAT) {
+            for (auto &e : enemies)
+                UpdateEnemyAI(e, tank, village, shells, flashes, cfg, dt);
+        }
         UpdateEnemies(enemies, particles, dt);
-        // Ally AI (orders + engage) + death animations.
-        UpdateAllies(allies, tank, enemies, village, shells, flashes, particles, cfg, dt);
+        // Ally AI (orders + engage) + death animations. In SETUP allies
+        // follow orders but do not engage hidden enemies.
+        UpdateAllies(allies, tank, enemies, village, shells, flashes, particles,
+                     cfg, phase == Phase::COMBAT, dt);
         // Wrecks block enemies too; enemies keep separation from each other.
         for (auto &e : enemies) {
             if (!e.alive) continue;
@@ -1512,11 +1529,14 @@ int main() {
                 Ally &sel = allies[selectedAlly];
                 if (sel.alive) {
                     Vector3 gp = mouseGround;
+                    // Enemies are hidden in SETUP: only move orders there.
                     int hitEnemy = -1;
-                    for (size_t ei = 0; ei < enemies.size(); ++ei) {
-                        if (!enemies[ei].alive) continue;
-                        float dx = gp.x - enemies[ei].pos.x, dz = gp.z - enemies[ei].pos.z;
-                        if (dx * dx + dz * dz < 16.0f) { hitEnemy = (int)ei; break; }
+                    if (phase == Phase::COMBAT) {
+                        for (size_t ei = 0; ei < enemies.size(); ++ei) {
+                            if (!enemies[ei].alive) continue;
+                            float dx = gp.x - enemies[ei].pos.x, dz = gp.z - enemies[ei].pos.z;
+                            if (dx * dx + dz * dz < 16.0f) { hitEnemy = (int)ei; break; }
+                        }
                     }
                     if (hitEnemy >= 0) {
                         sel.order = AllyOrder::ATTACK;
@@ -1545,7 +1565,8 @@ int main() {
         DrawGrid(40, 20.0f);
         DrawVillage(village);
         DrawTank(tank, mode == CamMode::GUNNER);
-        DrawEnemies(enemies, cfg);
+        // Enemies are hidden until combat begins.
+        if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
         DrawAllies(allies, enemies, cfg, selectedAlly);
         // Drone-mode mouse cursor: ring + crosshair on the ground.
         if (mode == CamMode::DRONE && mouseGroundValid) {
@@ -1595,8 +1616,13 @@ int main() {
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
-        DrawText(TextFormat("TANKSHOOTER v0.6  [%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
-        DrawText("W/S drive  A/D turn hull  Mouse aim  Click/Space fire (both modes)  Arrows = WASD  ESC quit", 16, 40, 18, GRAY);
+        DrawText(TextFormat("[%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
+        if (mode == CamMode::GUNNER){
+            DrawText("W/S drive A/D turn hull Mouse aim Click/Space fire Arrows = WASD ESC quit", 16, 40, 18, WHITE);
+        }
+        else {
+            DrawText("Drone: WASD/Arrows fly  Q/E down/up  Shift boost", 16, 40, 18, WHITE);
+        }
         if (mode == CamMode::DRONE) {
             // Virtual cursor crosshair.
             float cx = droneCursor.x, cy = droneCursor.y;
@@ -1606,7 +1632,10 @@ int main() {
         }
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
-        DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
+        if (phase == Phase::SETUP)
+            DrawText(TextFormat("Enemies inbound: %d (hidden)", aliveCount), 16, 64, 20, RED);
+        else
+            DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
         DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 90, 20,
                  tank.hp > 1 ? DARKGREEN : RED);
         // Ally status: order + HP for each.
@@ -1627,6 +1656,37 @@ int main() {
             int y0 = 116 + (int)allies.size() * 22 + 6;
             DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
             DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
+        }
+        // SETUP overlay: position forces, see the map, then start the battle.
+        if (phase == Phase::SETUP) {
+            int pw = 640, ph = 300;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
+            DrawRectangle(px, py, pw, ph, Color{ 10, 10, 20, 220 });
+            DrawRectangleLines(px, py, pw, ph, SKYBLUE);
+            int tx = px + 24, ty = py + 20;
+            DrawText("SETUP PHASE", tx, ty, 30, SKYBLUE);
+            ty += 42;
+            DrawText(TextFormat("Enemy armor inbound: %d tanks (positions unknown)", cfg.enemyCount),
+                     tx, ty, 20, RED);
+            ty += 34;
+            DrawText("Position your forces before the battle begins:", tx, ty, 20, WHITE);
+            ty += 30;
+            DrawText("- TAB: switch between GUNNER and DRONE view", tx, ty, 18, LIGHTGRAY);
+            ty += 26;
+            if (mode == CamMode::DRONE) {
+                DrawText("- Move the mouse to aim the cursor", tx, ty, 18, LIGHTGRAY);
+                ty += 26;
+                DrawText("- Right-click ground: send selected ally there", tx, ty, 18, LIGHTGRAY);
+                ty += 26;
+                DrawText("- Right-click enemy: order ally to attack it", tx, ty, 18, LIGHTGRAY);
+                ty += 26;
+                DrawText("- 1/2 select ally,  F follow,  H hold position", tx, ty, 18, LIGHTGRAY);
+                ty += 26;
+                DrawText("- Arrows rotate drone,  WASD/QE move drone", tx, ty, 18, LIGHTGRAY);
+                ty += 36;
+            }
+            if ((frameCount / 30) % 2 == 0)
+                DrawText("Press ENTER to start the battle", tx, ty, 22, GREEN);
         }
         // Tracking ping: any enemy with an active lock?
         bool tracked = false;
@@ -1672,9 +1732,7 @@ int main() {
             DrawLineEx(compC, Vector2Add(compC, Vector2Scale(an, 33.0f)), 4.0f, YELLOW);
             DrawCircleV(compC, 4, YELLOW);
             DrawText("TURRET", (int)compC.x - 26, (int)compC.y + 44, 14, DARKGRAY);
-        } else {
-            DrawText("Drone: WASD/arrows fly  Q/E down/up  Shift boost", 16, 62, 18, GRAY);
-        }
+        } 
         DrawFPS(screenWidth - 90, 12);
 
         EndDrawing();

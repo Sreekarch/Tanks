@@ -1,9 +1,61 @@
 {
-    "ally":{"aimSpread":0.06,"aimTime":1.2,"color":{"b":180,"g":120,"r":70},
-        "count":2,"engageOnSight":true,"fireInterval":3.5,"hitsToDestroy":2,"shootRange":70.0,"speed":10.0},
-    "building":{"hitsToDestroy":3},"collapse":{"durationSeconds":1.6},
-    "enemy":{"aimSpread":0.06,"aimTime":1.2,"color":{"b":50,"g":70,"r":165},
-        "count":6,"coverWaitTime":4.0,"fireInterval":3.5,"hitsToDestroy":2,"shootRange":70.0,"speed":10.0,"wreckBlocksMovement":true},
-    "player":{"hitsToDestroy":3,"speed":14.0},
-    "shell":{"cooldownSeconds":1.5,"lifetimeSeconds":4.0,"radius":0.18,"speed":70.0}
+  "ally": {
+    "aimSpread": 0.06,
+    "aimTime": 1.2,
+    "color": {
+      "b": 180,
+      "g": 120,
+      "r": 70
+    },
+    "count": 2,
+    "engageOnSight": true,
+    "fireInterval": 3.5,
+    "hitsToDestroy": 2,
+    "shootRange": 70.0,
+    "speed": 10.0
+  },
+  "building": {
+    "hitsToDestroy": 3
+  },
+  "collapse": {
+    "durationSeconds": 1.6
+  },
+  "enemy": {
+    "aimSpread": 0.06,
+    "aimTime": 1.2,
+    "color": {
+      "b": 50,
+      "g": 70,
+      "r": 165
+    },
+    "count": 4,
+    "coverWaitTime": 4.0,
+    "fireInterval": 3.5,
+    "hitsToDestroy": 2,
+    "shootRange": 70.0,
+    "speed": 10.0,
+    "wreckBlocksMovement": true
+  },
+  "player": {
+    "hitsToDestroy": 3,
+    "speed": 14.0
+  },
+  "shell": {
+    "cooldownSeconds": 1.5,
+    "lifetimeSeconds": 4.0,
+    "radius": 0.18,
+    "speed": 70.0
+  },
+  "minimap": {
+    "enabled": true,
+    "size": 240,
+    "height": 150.0
+  },
+  "chaseView": {
+    "enabled": true,
+    "width": 320,
+    "height": 180,
+    "camHeight": 26.0,
+    "camDistance": 30.0
+  }
 }

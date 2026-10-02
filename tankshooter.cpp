@@ -54,6 +54,16 @@ struct Config {
     float allyFireInt      = 3.5f;
     float allySpread       = 0.06f;
     float allyAimTime      = 1.2f;
+    // Minimap (gunner mode picture-in-picture)
+    bool  minimapEnabled   = true;
+    int   minimapSize      = 240;    // pixels (square)
+    float minimapHeight    = 150.0f; // top-down camera altitude
+    // Chase drone view (gunner mode picture-in-picture above the minimap)
+    bool  chaseEnabled     = true;
+    int   chaseWidth       = 320;
+    int   chaseHeight      = 180;
+    float chaseCamHeight   = 26.0f;  // camera altitude above the tank
+    float chaseCamDist     = 30.0f;  // camera distance behind the tank
 };
 
 // Loads Tanks.json from the working directory. Missing file or bad values
@@ -104,6 +114,16 @@ static Config LoadConfig() {
         c.allyColor.r = (unsigned char)ac.value("r", (int)c.allyColor.r);
         c.allyColor.g = (unsigned char)ac.value("g", (int)c.allyColor.g);
         c.allyColor.b = (unsigned char)ac.value("b", (int)c.allyColor.b);
+        auto mm = j.value("minimap", nlohmann::json::object());
+        c.minimapEnabled = mm.value("enabled", c.minimapEnabled);
+        c.minimapSize     = mm.value("size", c.minimapSize);
+        c.minimapHeight   = mm.value("height", c.minimapHeight);
+        auto cv = j.value("chaseView", nlohmann::json::object());
+        c.chaseEnabled   = cv.value("enabled", c.chaseEnabled);
+        c.chaseWidth     = cv.value("width", c.chaseWidth);
+        c.chaseHeight    = cv.value("height", c.chaseHeight);
+        c.chaseCamHeight = cv.value("camHeight", c.chaseCamHeight);
+        c.chaseCamDist   = cv.value("camDistance", c.chaseCamDist);
     } catch (...) { /* keep defaults */ }
     return c;
 }
@@ -516,6 +536,14 @@ static void UpdateDrone(DroneCam &d, float dt) {
     if (IsKeyDown(KEY_Q)) d.pos.y -= sp * dt;
     if (IsKeyDown(KEY_E)) d.pos.y += sp * dt;
     d.pos.y = Clamp(d.pos.y, 2.0f, 150.0f);
+}
+
+// Place the drone just above and behind the tank, looking the way the
+// tank faces (toward the village). Used at startup, on TAB, and on R.
+static void ResetDroneView(DroneCam &d, const Tank &tank) {
+    d.pos = Vector3{ tank.pos.x, 35.0f, tank.pos.z + 25.0f };
+    d.yaw = tank.hullAngle;
+    d.pitch = -0.6f;
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,13 +1260,134 @@ static void DrawAllies(const std::vector<Ally> &allies, const std::vector<Enemy>
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// Minimap: top-down picture-in-picture that follows the player tank.
+// Rendered to a square texture, then blitted to the bottom-right corner.
+static void DrawMinimap(RenderTexture2D target, const Tank &tank,
+                        const std::vector<Ally> &allies,
+                        const std::vector<Enemy> &enemies,
+                        const std::vector<Building> &village,
+                        const std::vector<Shell> &shells,
+                        const Config &cfg, Phase phase,
+                        int screenWidth, int screenHeight) {
+    int S = cfg.minimapSize;
+    Camera3D mc = {};
+    mc.position = Vector3{ tank.pos.x, cfg.minimapHeight, tank.pos.z };
+    mc.target = tank.pos;
+    mc.up = Vector3{ 0.0f, 0.0f, -1.0f };  // north (-Z) is up
+    mc.fovy = 55.0f;
+    mc.projection = CAMERA_PERSPECTIVE;
+
+    BeginTextureMode(target);
+    ClearBackground(Color{ 25, 30, 25, 255 });
+    BeginMode3D(mc);
+    DrawPlane(Vector3{ tank.pos.x, 0.0f, tank.pos.z }, Vector2{ 500.0f, 500.0f },
+              Color{ 40, 55, 40, 255 });
+    for (const auto &b : village) {
+        if (b.destroyed)
+            DrawCube(Vector3{ b.center.x, 0.5f, b.center.z },
+                     b.size.x, 1.0f, b.size.z, Color{ 85, 80, 75, 255 });
+        else
+            DrawCube(Vector3{ b.center.x, b.center.y, b.center.z },
+                     b.size.x, b.size.y, b.size.z, Color{ 125, 120, 110, 255 });
+    }
+    auto marker = [](Vector3 p, float heading, Color c) {
+        rlPushMatrix();
+        rlTranslatef(p.x, 1.0f, p.z);
+        rlRotatef(heading * RAD2DEG, 0.0f, 1.0f, 0.0f);
+        DrawCube(Vector3{ 0.0f, 0.0f, 0.0f }, 4.0f, 2.0f, 6.5f, c);
+        // Nose tick so heading reads at a glance.
+        DrawCube(Vector3{ 0.0f, 0.0f, -4.0f }, 1.5f, 2.2f, 1.5f, WHITE);
+        rlPopMatrix();
+    };
+    marker(tank.pos, tank.hullAngle, GREEN);
+    for (const auto &a : allies)
+        if (a.alive) marker(a.pos, a.hullAngle, cfg.allyColor);
+    // Enemies stay hidden during SETUP.
+    if (phase == Phase::COMBAT)
+        for (const auto &e : enemies)
+            if (e.alive) marker(e.pos, e.hullAngle, cfg.enemyColor);
+    for (const auto &s : shells) DrawSphere(s.pos, 1.2f, YELLOW);
+    EndMode3D();
+    EndTextureMode();
+
+    int mx = screenWidth - S - 16, my = screenHeight - S - 16;
+    DrawTextureRec(target.texture, Rectangle{ 0.0f, 0.0f, (float)S, -(float)S },
+                   Vector2{ (float)mx, (float)my }, WHITE);
+    DrawRectangleLines(mx, my, S, S, WHITE);
+    DrawText("MAP", mx + 8, my + 6, 16, WHITE);
+}
+
+// Chase drone view: live follow-camera window above the minimap in gunner
+// mode. The camera stays above/behind the player tank (high enough to see
+// over buildings) and tracks it, so the tank is always in frame.
+static void DrawChaseView(RenderTexture2D target, const Tank &tank,
+                          const std::vector<Ally> &allies,
+                          const std::vector<Enemy> &enemies,
+                          const std::vector<Building> &village,
+                          const std::vector<Shell> &shells,
+                          const std::vector<Flash> &flashes,
+                          const std::vector<Particle> &particles,
+                          const Config &cfg, Phase phase, int selectedAlly,
+                          int screenWidth, int screenHeight) {
+    int W = cfg.chaseWidth, H = cfg.chaseHeight;
+    Vector3 behind = { -sinf(tank.hullAngle), 0.0f, cosf(tank.hullAngle) };
+    Camera3D cc = {};
+    cc.position = Vector3{ tank.pos.x + behind.x * cfg.chaseCamDist,
+                            tank.pos.y + cfg.chaseCamHeight,
+                            tank.pos.z + behind.z * cfg.chaseCamDist };
+    cc.target = Vector3{ tank.pos.x, tank.pos.y + 2.0f, tank.pos.z };
+    cc.up = Vector3{ 0.0f, 1.0f, 0.0f };
+    cc.fovy = 60.0f;
+    cc.projection = CAMERA_PERSPECTIVE;
+
+    BeginTextureMode(target);
+    ClearBackground(SKYBLUE);
+    BeginMode3D(cc);
+    DrawPlane(Vector3{ 0, 0, 0 }, Vector2{ ARENA_HALF * 2 + 40, ARENA_HALF * 2 + 40 },
+              Color{ 168, 148, 118, 255 });
+    DrawGrid(40, 20.0f);
+    DrawVillage(village);
+    DrawTank(tank, false);  // solid, never the gunner ghost
+    if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
+    DrawAllies(allies, enemies, cfg, selectedAlly);
+    for (const auto &s : shells) {
+        if (s.trailCount >= 2)
+            DrawCylinderEx(s.trail[0], s.pos, 0.22f, 0.22f, 8,
+                           Color{ 255, 175, 65, 255 });
+        DrawSphere(s.pos, 0.35f, Color{ 255, 240, 180, 255 });
+    }
+    for (const auto &f : flashes) {
+        float a = f.t / f.maxT;
+        DrawSphere(f.pos, f.size * (0.5f + 0.5f * a),
+                   Color{ 255, 180, 60, (unsigned char)(255 * a) });
+    }
+    for (const auto &p : particles) {
+        float a = fmaxf(p.life / p.maxLife, 0.0f);
+        DrawSphere(p.pos, p.size * (0.4f + 0.6f * a),
+                   Color{ p.color.r, p.color.g, p.color.b, (unsigned char)(255 * a) });
+    }
+    EndMode3D();
+    EndTextureMode();
+
+    // Blit above the minimap, right-aligned.
+    int my = screenHeight - cfg.minimapSize - 16;  // minimap top edge
+    int cx = screenWidth - W - 16;
+    int cy = my - H - 12;
+    DrawTextureRec(target.texture, Rectangle{ 0.0f, 0.0f, (float)W, -(float)H },
+                   Vector2{ (float)cx, (float)cy }, WHITE);
+    DrawRectangleLines(cx, cy, W, H, WHITE);
+    DrawText("DRONE", cx + 8, cy + 6, 16, WHITE);
+}
+
 int main() {
     const int screenWidth = 1280, screenHeight = 720;
     InitWindow(screenWidth, screenHeight, "Tankshooter v0.6");
     SetTargetFPS(60);
-    DisableCursor();
+    // Cursor starts enabled: the game opens in drone mode (setup phase).
 
     Config cfg = LoadConfig();
+    RenderTexture2D minimapTarget = LoadRenderTexture(cfg.minimapSize, cfg.minimapSize);
+    RenderTexture2D chaseTarget = LoadRenderTexture(cfg.chaseWidth, cfg.chaseHeight);
     std::vector<Building> village = BuildVillage(cfg.buildingHits);
     std::vector<Enemy> enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
     Tank tank;
@@ -1252,8 +1401,12 @@ int main() {
     float fireCooldown = 0.0f;
     DroneCam drone;
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
-    CamMode mode = CamMode::GUNNER;
+    // Setup phase starts in drone mode so the player can survey the map
+    // and position allies before combat.
+    CamMode mode = CamMode::DRONE;
     Phase phase = Phase::SETUP;
+    ResetDroneView(drone, tank);
+    EnableCursor();
     bool gameOver = false;
     Camera3D camera = {};
     camera.position = Vector3{ 0.0f, 10.0f, 10.0f };
@@ -1275,7 +1428,8 @@ int main() {
         int aliveNow = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveNow;
         if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
-            // Restart: fresh village, enemies, allies, player. Back to SETUP.
+            // Restart: fresh village, enemies, allies, player. Back to SETUP
+            // in drone mode.
             tank = Tank{};
             tank.hp = tank.maxHp = cfg.playerHits;
             village = BuildVillage(cfg.buildingHits);
@@ -1284,14 +1438,19 @@ int main() {
             selectedAlly = 0;
             shells.clear(); flashes.clear(); particles.clear(); pings.clear();
             fireCooldown = 0.0f;
-            mode = CamMode::GUNNER;
+            mode = CamMode::DRONE;
+            ResetDroneView(drone, tank);
+            EnableCursor();
             phase = Phase::SETUP;
             gameOver = false;
         }
 
-        // ENTER starts the battle from the setup phase.
+        // ENTER starts the battle from the setup phase and drops the player
+        // into the gunner seat.
         if (phase == Phase::SETUP && IsKeyPressed(KEY_ENTER)) {
             phase = Phase::COMBAT;
+            mode = CamMode::GUNNER;
+            DisableCursor();
         }
 
         if (!gameOver) {
@@ -1307,11 +1466,7 @@ int main() {
         if (tabDown && !tabWasDown) {
             mode = (mode == CamMode::GUNNER) ? CamMode::DRONE : CamMode::GUNNER;
             if (mode == CamMode::DRONE) {
-                // Start the drone just above and behind the tank, looking
-                // the way the tank faces (toward the village).
-                drone.pos = Vector3{ tank.pos.x, 35.0f, tank.pos.z + 25.0f };
-                drone.yaw = tank.hullAngle;
-                drone.pitch = -0.6f;
+                ResetDroneView(drone, tank);
                 // Drone mode needs a visible cursor for click-to-order;
                 // gunner mode uses relative mouse-look.
                 EnableCursor();
@@ -1321,11 +1476,10 @@ int main() {
         }
         tabWasDown = tabDown;
 
-        // Ally orders (drone mode only): 1..N select, right-click ground =
-        // move, right-click enemy = attack, F = follow, H = hold.
-        // (Mouse ground point + right-click are handled after the camera
-        // update below, so the ray uses the current frame's camera.)
-        if (mode == CamMode::DRONE && !allies.empty()) {
+        // Ally orders (both modes): 1..N select, F = follow, H = hold.
+        // Right-click move/attack targeting stays drone-only (it needs the
+        // drone's ground cursor; handled after the camera update below).
+        if (!allies.empty()) {
             for (size_t i = 0; i < allies.size() && i < 9; ++i) {
                 if (IsKeyPressed(KEY_ONE + (int)i)) selectedAlly = (int)i;
             }
@@ -1614,11 +1768,22 @@ int main() {
         if (mode == CamMode::GUNNER) DrawTurretGhost(tank);
         EndMode3D();
 
+        // Minimap (gunner mode): top-down view following the player tank.
+        if (mode == CamMode::GUNNER && cfg.minimapEnabled)
+            DrawMinimap(minimapTarget, tank, allies, enemies, village, shells,
+                        cfg, phase, screenWidth, screenHeight);
+        // Chase drone view above the minimap: follow-cam on the player tank.
+        if (mode == CamMode::GUNNER && cfg.chaseEnabled)
+            DrawChaseView(chaseTarget, tank, allies, enemies, village, shells,
+                          flashes, particles, cfg, phase, selectedAlly,
+                          screenWidth, screenHeight);
+
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("[%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         if (mode == CamMode::GUNNER){
             DrawText("W/S drive A/D turn hull Mouse aim Click/Space fire Arrows = WASD ESC quit", 16, 40, 18, WHITE);
+            DrawText("1/2 select ally   F follow   H hold", 16, 62, 18, WHITE);
         }
         else {
             DrawText("Drone: WASD/Arrows fly  Q/E down/up  Shift boost", 16, 40, 18, WHITE);
@@ -1633,10 +1798,10 @@ int main() {
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
         if (phase == Phase::SETUP)
-            DrawText(TextFormat("Enemies inbound: %d (hidden)", aliveCount), 16, 64, 20, RED);
+            DrawText(TextFormat("Enemies inbound: %d (hidden)", aliveCount), 16, 88, 20, RED);
         else
-            DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 64, 20, RED);
-        DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 90, 20,
+            DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 88, 20, RED);
+        DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 114, 20,
                  tank.hp > 1 ? DARKGREEN : RED);
         // Ally status: order + HP for each.
         for (size_t i = 0; i < allies.size(); ++i) {
@@ -1650,10 +1815,10 @@ int main() {
             Color c = (i == (size_t)selectedAlly) ? WHITE : LIGHTGRAY;
             if (!a.alive) c = RED;
             DrawText(TextFormat("Ally %d [%s] %d/%d", (int)i + 1, on, a.hp, a.maxHp),
-                     16, 116 + (int)i * 22, 18, c);
+                     16, 140 + (int)i * 22, 18, c);
         }
         if (mode == CamMode::DRONE) {
-            int y0 = 116 + (int)allies.size() * 22 + 6;
+            int y0 = 140 + (int)allies.size() * 22 + 6;
             DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
             DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
         }
@@ -1686,7 +1851,7 @@ int main() {
                 ty += 36;
             }
             if ((frameCount / 30) % 2 == 0)
-                DrawText("Press ENTER to start the battle", tx, ty, 22, GREEN);
+                DrawText("Press ENTER to start the battle (gunner view)", tx, ty, 22, GREEN);
         }
         // Tracking ping: any enemy with an active lock?
         bool tracked = false;
@@ -1738,6 +1903,8 @@ int main() {
         EndDrawing();
     }
 
+    UnloadRenderTexture(minimapTarget);
+    UnloadRenderTexture(chaseTarget);
     CloseWindow();
     return 0;
 }

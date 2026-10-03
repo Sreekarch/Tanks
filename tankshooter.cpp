@@ -553,7 +553,8 @@ struct Shell {
     Vector3 pos;
     Vector3 vel;
     float life;
-    bool fromEnemy = false;  // true: hostile shell, hits the player
+    bool fromEnemy = false;   // true: hostile shell, hits the player
+    bool fromPlayer = false;  // true: fired by the player (not an ally)
     static constexpr int TRAIL = 24;
     Vector3 trail[TRAIL];
     int trailCount = 0;
@@ -662,6 +663,7 @@ static void FireShell(const Tank &t, std::vector<Shell> &shells, const Config &c
     s.pos = muzzle;
     s.vel = Vector3Scale(fwd, cfg.shellSpeed);
     s.life = cfg.shellLifetime;
+    s.fromPlayer = true;
     s.trail[0] = muzzle;
     s.trailCount = 1;
     shells.push_back(s);
@@ -1399,6 +1401,9 @@ int main() {
     std::vector<OrderPing> pings;
     std::vector<Particle> particles;
     float fireCooldown = 0.0f;
+    // Battle stats (reset on R, battleStart set on ENTER).
+    int shotsFired = 0, shotsHit = 0, playerKills = 0;
+    double battleStart = 0.0;
     DroneCam drone;
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
@@ -1438,6 +1443,8 @@ int main() {
             selectedAlly = 0;
             shells.clear(); flashes.clear(); particles.clear(); pings.clear();
             fireCooldown = 0.0f;
+            shotsFired = 0; shotsHit = 0; playerKills = 0;
+            battleStart = 0.0;
             mode = CamMode::DRONE;
             ResetDroneView(drone, tank);
             EnableCursor();
@@ -1451,6 +1458,7 @@ int main() {
             phase = Phase::COMBAT;
             mode = CamMode::GUNNER;
             DisableCursor();
+            battleStart = GetTime();
         }
 
         if (!gameOver) {
@@ -1507,6 +1515,7 @@ int main() {
             fireCooldown <= 0.0f && phase == Phase::COMBAT) {
             FireShell(tank, shells, cfg);
             fireCooldown = cfg.shellCooldown;
+            shotsFired++;
             Vector3 muzzle = MuzzleWorldPos(tank);
             // Compact bright burst at the muzzle tip (not a beach ball).
             flashes.push_back(Flash{ muzzle, 0.22f, 0.22f, 0.9f });
@@ -1564,7 +1573,12 @@ int main() {
                 } else {
                     for (auto &e : enemies) {
                         if (ShellHitsEnemy(it->pos, cfg.shellRadius, e)) {
+                            bool wasAlive = e.alive;
                             DamageEnemy(e, particles, flashes, tank.pos, village);
+                            if (it->fromPlayer) {
+                                shotsHit++;
+                                if (wasAlive && !e.alive) playerKills++;
+                            }
                             flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
                             dead = true;
                             break;
@@ -1782,11 +1796,40 @@ int main() {
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("[%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
         if (mode == CamMode::GUNNER){
-            DrawText("W/S drive A/D turn hull Mouse aim Click/Space fire Arrows = WASD ESC quit", 16, 40, 18, WHITE);
-            DrawText("1/2 select ally   F follow   H hold", 16, 62, 18, WHITE);
+            // D-pad cross: WASD + arrow labels on the arms (drive controls).
+            int dx = 16, dy = 36, s = 34;
+            Color armBg = Color{ 60, 60, 70, 220 };
+            DrawRectangle(dx + s, dy + s, s, s, Color{ 40, 40, 48, 220 });
+            struct PadArm { int ox, oy; const char *key; const char *arr; };
+            PadArm arms[4] = { {s,0,"W","^"}, {0,s,"A","<"}, {2*s,s,"D",">"}, {s,2*s,"S","v"} };
+            for (auto &a : arms) {
+                int bx = dx + a.ox, by = dy + a.oy;
+                DrawRectangle(bx, by, s, s, armBg);
+                DrawRectangleLines(bx, by, s, s, LIGHTGRAY);
+                DrawText(a.key, bx + s/2 - 6, by + 2, 18, WHITE);
+                DrawText(a.arr, bx + s/2 - 5, by + 20, 13, LIGHTGRAY);
+            }
+            DrawText("Mouse aim", dx + 3*s + 12, dy + 2, 16, WHITE);
+            DrawText("Click / Space: fire", dx + 3*s + 12, dy + 24, 16, WHITE);
+            DrawText("1/2 ally  F follow  H hold", dx + 3*s + 12, dy + 46, 16, WHITE);
         }
         else {
-            DrawText("Drone: WASD/Arrows fly  Q/E down/up  Shift boost", 16, 40, 18, WHITE);
+            // D-pad cross in drone mode too: WASD flies, arrows rotate view.
+            int dx = 16, dy = 36, s = 34;
+            Color armBg = Color{ 60, 60, 70, 220 };
+            DrawRectangle(dx + s, dy + s, s, s, Color{ 40, 40, 48, 220 });
+            struct PadArmD { int ox, oy; const char *key; const char *arr; };
+            PadArmD armsd[4] = { {s,0,"W","^"}, {0,s,"A","<"}, {2*s,s,"D",">"}, {s,2*s,"S","v"} };
+            for (auto &a : armsd) {
+                int bx = dx + a.ox, by = dy + a.oy;
+                DrawRectangle(bx, by, s, s, armBg);
+                DrawRectangleLines(bx, by, s, s, LIGHTGRAY);
+                DrawText(a.key, bx + s/2 - 6, by + 2, 18, WHITE);
+                DrawText(a.arr, bx + s/2 - 5, by + 20, 13, LIGHTGRAY);
+            }
+            DrawText("WASD: fly drone", dx + 3*s + 12, dy + 2, 16, WHITE);
+            DrawText("Arrows: rotate view", dx + 3*s + 12, dy + 24, 16, WHITE);
+            DrawText("Q / E: down / up   Shift: boost", dx + 3*s + 12, dy + 46, 16, WHITE);
         }
         if (mode == CamMode::DRONE) {
             // Virtual cursor crosshair.
@@ -1794,15 +1837,51 @@ int main() {
             DrawLine((int)cx - 12, (int)cy, (int)cx + 12, (int)cy, WHITE);
             DrawLine((int)cx, (int)cy - 12, (int)cx, (int)cy + 12, WHITE);
             DrawCircleLines((int)cx, (int)cy, 6.0f, WHITE);
+            // Reload bar under the cursor.
+            {
+                float frac = (phase == Phase::COMBAT && cfg.shellCooldown > 0.0f)
+                    ? Clamp(1.0f - fireCooldown / cfg.shellCooldown, 0.0f, 1.0f) : 1.0f;
+                int bw = 80;
+                DrawRectangle((int)cx - bw/2, (int)cy + 20, bw, 6, Color{ 0, 0, 0, 140 });
+                DrawRectangle((int)cx - bw/2, (int)cy + 20, (int)(bw * frac), 6,
+                              frac >= 1.0f ? GREEN : ORANGE);
+            }
         }
         int aliveCount = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveCount;
-        if (phase == Phase::SETUP)
-            DrawText(TextFormat("Enemies inbound: %d (hidden)", aliveCount), 16, 88, 20, RED);
-        else
-            DrawText(TextFormat("Enemies left: %d", aliveCount), 16, 88, 20, RED);
-        DrawText(TextFormat("Hull: %d/%d", tank.hp, tank.maxHp), 16, 114, 20,
-                 tank.hp > 1 ? DARKGREEN : RED);
+        // Status block top: below the D-pad in both modes.
+        int sy = 150;
+        // Enemies: tank icon + xN.
+        {
+            DrawRectangle(16, sy, 26, 18, cfg.enemyColor);
+            DrawRectangle(16 + 11, sy - 7, 4, 12, DARKGRAY);  // barrel
+            const char *lbl = (phase == Phase::SETUP)
+                ? TextFormat("x %d (hidden)", aliveCount)
+                : TextFormat("x %d", aliveCount);
+            DrawText(lbl, 50, sy - 2, 20, RED);
+        }
+        // Hull: heart + xN.
+        {
+            int hx = 16, hy = sy + 26;
+            // Two lobes + triangle point, overlapped so they read as one heart.
+            DrawCircle(hx + 8, hy + 8, 8, RED);
+            DrawCircle(hx + 18, hy + 8, 8, RED);
+            DrawTriangle(Vector2{ (float)hx + 1, (float)hy + 8 },
+                         Vector2{ (float)hx + 25, (float)hy + 8 },
+                         Vector2{ (float)hx + 13, (float)hy + 29 }, RED);
+            DrawText(TextFormat("x %d", tank.hp), hx + 32, hy + 4, 20,
+                     tank.hp > 1 ? DARKGREEN : RED);
+        }
+        // Kills + battle timer (combat only).
+        if (phase == Phase::COMBAT) {
+            int destroyed = cfg.enemyCount - aliveCount;
+            DrawText(TextFormat("Kills: %d", destroyed), 16, sy + 52, 20, DARKGRAY);
+            if (battleStart > 0.0) {
+                int secs = (int)(GetTime() - battleStart);
+                DrawText(TextFormat("Time %d:%02d", secs / 60, secs % 60),
+                         120, sy + 52, 20, DARKGRAY);
+            }
+        }
         // Ally status: order + HP for each.
         for (size_t i = 0; i < allies.size(); ++i) {
             const auto &a = allies[i];
@@ -1815,10 +1894,10 @@ int main() {
             Color c = (i == (size_t)selectedAlly) ? WHITE : LIGHTGRAY;
             if (!a.alive) c = RED;
             DrawText(TextFormat("Ally %d [%s] %d/%d", (int)i + 1, on, a.hp, a.maxHp),
-                     16, 140 + (int)i * 22, 18, c);
+                     16, sy + 78 + (int)i * 22, 18, c);
         }
         if (mode == CamMode::DRONE) {
-            int y0 = 140 + (int)allies.size() * 22 + 6;
+            int y0 = sy + 78 + (int)allies.size() * 22 + 6;
             DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
             DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
         }
@@ -1868,19 +1947,56 @@ int main() {
             DrawRectangle(0, 0, 10, screenHeight, Color{ 255, 0, 0, (unsigned char)(a * 200) });
             DrawRectangle(screenWidth - 10, 0, 10, screenHeight, Color{ 255, 0, 0, (unsigned char)(a * 200) });
         }
+        // Shared end-of-battle stats lines.
+        auto battleStats = [&](int tx, int ty, int lh, Color c) {
+            int secs = battleStart > 0.0 ? (int)(GetTime() - battleStart) : 0;
+            int destroyed = cfg.enemyCount - aliveCount;
+            float acc = shotsFired > 0 ? 100.0f * shotsHit / shotsFired : 0.0f;
+            DrawText(TextFormat("Time  %d:%02d", secs / 60, secs % 60), tx, ty, 20, c);
+            DrawText(TextFormat("Enemies destroyed  %d / %d", destroyed, cfg.enemyCount),
+                     tx, ty + lh, 20, c);
+            DrawText(TextFormat("Your kills  %d", playerKills), tx, ty + lh * 2, 20, c);
+            DrawText(TextFormat("Shots  %d   Accuracy  %.0f%%", shotsFired, acc),
+                     tx, ty + lh * 3, 20, c);
+        };
         if (gameOver) {
+            int pw = 460, ph = 330;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
             DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
-            DrawText("YOU DIED", screenWidth / 2 - 110, screenHeight / 2 - 40, 48, RED);
-            DrawText("Press R to restart", screenWidth / 2 - 110, screenHeight / 2 + 20, 24, WHITE);
-        } else if (aliveCount == 0) {
-            DrawText("Arena Cleared!", screenWidth / 2 - 110, 110, 32, DARKGREEN);
-            DrawText("Press R to restart", screenWidth / 2 - 110, 150, 22, DARKGRAY);
+            DrawRectangle(px, py, pw, ph, Color{ 20, 8, 8, 235 });
+            DrawRectangleLines(px, py, pw, ph, RED);
+            int tx = px + 30, ty = py + 24;
+            DrawText("DEFEAT", tx, ty, 40, RED);
+            DrawText("Your tank was destroyed.", tx, ty + 52, 20, LIGHTGRAY);
+            battleStats(tx, ty + 92, 30, WHITE);
+            if ((frameCount / 30) % 2 == 0)
+                DrawText("Press R to retry", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
+        } else if (aliveCount == 0 && phase == Phase::COMBAT) {
+            int pw = 460, ph = 330;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
+            DrawRectangle(px, py, pw, ph, Color{ 8, 20, 12, 235 });
+            DrawRectangleLines(px, py, pw, ph, GREEN);
+            int tx = px + 30, ty = py + 24;
+            DrawText("VICTORY", tx, ty, 40, GREEN);
+            DrawText("Arena cleared!", tx, ty + 52, 20, LIGHTGRAY);
+            battleStats(tx, ty + 92, 30, WHITE);
+            if ((frameCount / 30) % 2 == 0)
+                DrawText("Press R to play again", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
         }
         if (mode == CamMode::GUNNER) {
             // Crosshair
             int cx = screenWidth / 2, cy = screenHeight / 2;
             DrawLine(cx - 12, cy, cx + 12, cy, RED);
             DrawLine(cx, cy - 12, cx, cy + 12, RED);
+            // Reload bar under the gun.
+            {
+                float frac = (phase == Phase::COMBAT && cfg.shellCooldown > 0.0f)
+                    ? Clamp(1.0f - fireCooldown / cfg.shellCooldown, 0.0f, 1.0f) : 1.0f;
+                int bw = 110;
+                DrawRectangle(cx - bw/2, cy + 22, bw, 7, Color{ 0, 0, 0, 140 });
+                DrawRectangle(cx - bw/2, cy + 22, (int)(bw * frac), 7,
+                              frac >= 1.0f ? GREEN : ORANGE);
+            }
 
             // Turret compass (bottom-right, top-down, north = up):
             // green bar = hull direction, yellow needle = gun direction.

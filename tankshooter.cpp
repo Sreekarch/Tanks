@@ -14,8 +14,10 @@
 #include "rlgl.h"
 
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -54,6 +56,19 @@ struct Config {
     float allyFireInt      = 3.5f;
     float allySpread       = 0.06f;
     float allyAimTime      = 1.2f;
+    // Fog of war (hides enemies outside line of sight)
+    bool  fogEnabled       = true;
+    float fogSightRadius   = 90.0f;  // revealers see this far (with LOS)
+    // Ditches (tanks get stuck/slowed) and bridges
+    float ditchSlowFactor  = 0.15f;  // speed multiplier inside a ditch
+    float ditchDepth       = 3.0f;
+    // Turret towers (static defenses, hostile to player side)
+    int   towerHits        = 3;
+    float towerRange       = 75.0f;
+    float towerFireInt     = 4.0f;
+    float towerAimTime     = 1.0f;
+    // Map
+    char  mapDefault[64]   = "Crossroads";
     // Minimap (gunner mode picture-in-picture)
     bool  minimapEnabled   = true;
     int   minimapSize      = 240;    // pixels (square)
@@ -124,6 +139,20 @@ static Config LoadConfig() {
         c.chaseHeight    = cv.value("height", c.chaseHeight);
         c.chaseCamHeight = cv.value("camHeight", c.chaseCamHeight);
         c.chaseCamDist   = cv.value("camDistance", c.chaseCamDist);
+        auto fg = j.value("fog", nlohmann::json::object());
+        c.fogEnabled     = fg.value("enabled", c.fogEnabled);
+        c.fogSightRadius = fg.value("sightRadius", c.fogSightRadius);
+        auto dt2 = j.value("ditch", nlohmann::json::object());
+        c.ditchSlowFactor = dt2.value("slowFactor", c.ditchSlowFactor);
+        c.ditchDepth      = dt2.value("depth", c.ditchDepth);
+        auto tw = j.value("tower", nlohmann::json::object());
+        c.towerHits    = tw.value("hitsToDestroy", c.towerHits);
+        c.towerRange   = tw.value("shootRange", c.towerRange);
+        c.towerFireInt = tw.value("fireInterval", c.towerFireInt);
+        c.towerAimTime = tw.value("aimTime", c.towerAimTime);
+        auto mp = j.value("map", nlohmann::json::object());
+        std::string md = mp.value("default", std::string(c.mapDefault));
+        strncpy_s(c.mapDefault, md.c_str(), sizeof(c.mapDefault) - 1);
     } catch (...) { /* keep defaults */ }
     return c;
 }
@@ -154,6 +183,90 @@ struct HitMark {
     Vector3 normal;  // outward face normal (for orienting the scorch)
     float seed;      // randomizes the blast splotch pattern
 };
+
+// ---------------------------------------------------------------------------
+// Terrain: ditches, bridges, turret towers, and hand-authored maps
+// ---------------------------------------------------------------------------
+struct Ditch {
+    Vector3 center = { 0, 0, 0 };
+    float hx = 10.0f, hz = 10.0f;  // half-extents
+    float depth = 3.0f;
+};
+struct Bridge {
+    Vector3 center = { 0, 0, 0 };
+    float hx = 6.0f, hz = 14.0f;   // deck half-extents
+};
+struct Tower {
+    Vector3 pos = { 0, 0, 0 };
+    int hp = 3, maxHp = 3;
+    float turretAngle = 0.0f;  // world-space
+    float fireTimer = 0.0f, aimTimer = 0.0f;
+    bool targetPlayer = false;
+    int targetAlly = -1;
+    bool alive = true;
+    float hitFlashT = 0.0f;
+};
+struct GameMap {
+    std::string name;
+    int villageSeed = 1337;
+    std::vector<Ditch> ditches;
+    std::vector<Bridge> bridges;
+    std::vector<Vector3> towerPos;  // spawned into Tower with config HP
+};
+
+// Depth of ditch under (x,z), or 0. Bridges cancel the ditch beneath them.
+static float DitchDepthAt(float x, float z, const std::vector<Ditch> &ditches,
+                          const std::vector<Bridge> &bridges) {
+    for (const auto &b : bridges) {
+        if (fabsf(x - b.center.x) <= b.hx && fabsf(z - b.center.z) <= b.hz)
+            return 0.0f;
+    }
+    for (const auto &d : ditches) {
+        if (fabsf(x - d.center.x) <= d.hx && fabsf(z - d.center.z) <= d.hz)
+            return d.depth;
+    }
+    return 0.0f;
+}
+
+static bool PointInTower(float x, float z, const std::vector<Tower> &towers, float pad) {
+    for (const auto &t : towers) {
+        if (!t.alive) continue;
+        float dx = x - t.pos.x, dz = z - t.pos.z;
+        if (dx * dx + dz * dz < (3.5f + pad) * (3.5f + pad)) return true;
+    }
+    return false;
+}
+
+// Hand-authored maps. Add entries here to author by hand; the village itself
+// stays procedural per map seed.
+static std::vector<GameMap> BuildMaps(float ditchDepth) {
+    std::vector<GameMap> maps;
+
+    GameMap village;
+    village.name = "Village";
+    village.villageSeed = 1337;
+    maps.push_back(village);
+
+    GameMap cross;
+    cross.name = "Crossroads";
+    cross.villageSeed = 7331;
+    cross.ditches.push_back(Ditch{ Vector3{ 0, 0, 0 }, 190.0f, 12.0f, ditchDepth });
+    cross.bridges.push_back(Bridge{ Vector3{ 0, 0, 0 }, 8.0f, 18.0f });
+    cross.towerPos.push_back(Vector3{ 28, 0, 30 });
+    cross.towerPos.push_back(Vector3{ -28, 0, -30 });
+    maps.push_back(cross);
+
+    GameMap outpost;
+    outpost.name = "Outpost";
+    outpost.villageSeed = 9773;
+    outpost.ditches.push_back(Ditch{ Vector3{ -60, 0, -60 }, 40.0f, 14.0f, ditchDepth });
+    outpost.ditches.push_back(Ditch{ Vector3{ 70, 0, 60 }, 35.0f, 14.0f, ditchDepth });
+    outpost.towerPos.push_back(Vector3{ 0, 0, -70 });
+    outpost.towerPos.push_back(Vector3{ -70, 0, 40 });
+    maps.push_back(outpost);
+
+    return maps;
+}
 
 struct Building {
     Vector3 center;   // center of the box
@@ -205,9 +318,9 @@ static void DrawHitMark(const HitMark &m) {
 
 // Deterministic broken-down village: a street grid with buildings of random
 // height, some ruined (half height), plus rubble piles and broken walls.
-static std::vector<Building> BuildVillage(int hitsToDestroy) {
+static std::vector<Building> BuildVillage(int hitsToDestroy, int seed) {
     std::vector<Building> out;
-    SetRandomSeed(1337);
+    SetRandomSeed(seed);
 
     const float block = 40.0f;          // city block pitch
 
@@ -262,6 +375,80 @@ static std::vector<Building> BuildVillage(int hitsToDestroy) {
 
     for (auto &b : out) b.hp = b.maxHp = hitsToDestroy;
     return out;
+}
+
+// Ground with holes cut for ditches (tiled so pits are real openings),
+// plus ditch pit walls/floors.
+static void DrawGround(const std::vector<Ditch> &ditches) {
+    const float tile = 20.0f;
+    Color gc = { 168, 148, 118, 255 };
+    Color dirt = { 140, 118, 90, 255 };
+    for (float x = -ARENA_HALF; x < ARENA_HALF; x += tile) {
+        for (float z = -ARENA_HALF; z < ARENA_HALF; z += tile) {
+            float cx = x + tile * 0.5f, cz = z + tile * 0.5f;
+            bool inPit = false, inApron = false;
+            for (const auto &d : ditches) {
+                float ax = fabsf(cx - d.center.x), az = fabsf(cz - d.center.z);
+                if (ax < d.hx && az < d.hz) { inPit = true; break; }
+                if (ax < d.hx + tile * 0.5f && az < d.hz + tile * 0.5f) inApron = true;
+            }
+            if (inPit) continue;
+            DrawPlane(Vector3{ cx, 0.0f, cz }, Vector2{ tile, tile },
+                      inApron ? dirt : gc);
+        }
+    }
+    // Ditch pits: floor + 4 walls.
+    for (const auto &d : ditches) {
+        Color wall = { 101, 76, 52, 255 };
+        Color dark = { 50, 38, 26, 255 };
+        DrawPlane(Vector3{ d.center.x, -d.depth, d.center.z },
+                  Vector2{ d.hx * 2, d.hz * 2 }, dark);
+        float wy = -d.depth * 0.5f;
+        DrawCube(Vector3{ d.center.x, wy, d.center.z - d.hz }, d.hx * 2, d.depth, 0.6f, wall);
+        DrawCube(Vector3{ d.center.x, wy, d.center.z + d.hz }, d.hx * 2, d.depth, 0.6f, wall);
+        DrawCube(Vector3{ d.center.x - d.hx, wy, d.center.z }, 0.6f, d.depth, d.hz * 2, wall);
+        DrawCube(Vector3{ d.center.x + d.hx, wy, d.center.z }, 0.6f, d.depth, d.hz * 2, wall);
+    }
+}
+
+static void DrawBridges(const std::vector<Bridge> &bridges) {
+    for (const auto &b : bridges) {
+        Color wood = { 139, 110, 70, 255 };
+        DrawCube(Vector3{ b.center.x, 0.0f, b.center.z }, b.hx * 2, 0.5f, b.hz * 2, wood);
+        // Rails.
+        DrawCube(Vector3{ b.center.x - b.hx + 0.3f, 1.0f, b.center.z }, 0.3f, 1.0f, b.hz * 2,
+                 Color{ 100, 78, 50, 255 });
+        DrawCube(Vector3{ b.center.x + b.hx - 0.3f, 1.0f, b.center.z }, 0.3f, 1.0f, b.hz * 2,
+                 Color{ 100, 78, 50, 255 });
+    }
+}
+
+static void DrawTowers(const std::vector<Tower> &towers, int frameCount) {
+    for (const auto &t : towers) {
+        if (!t.alive) {
+            // Rubble.
+            DrawCylinder(Vector3{ t.pos.x, 0.5f, t.pos.z }, 3.2f, 3.8f, 1.0f, 8,
+                         Color{ 60, 58, 55, 255 });
+            continue;
+        }
+        Color concrete = t.hitFlashT > 0.0f ? WHITE : Color{ 130, 130, 135, 255 };
+        Color dark = t.hitFlashT > 0.0f ? WHITE : Color{ 70, 70, 78, 255 };
+        DrawCylinder(Vector3{ t.pos.x, 0.0f, t.pos.z }, 3.0f, 3.6f, 4.0f, 10, concrete);
+        DrawCylinder(Vector3{ t.pos.x, 4.0f, t.pos.z }, 2.2f, 2.6f, 1.0f, 10, dark);
+        rlPushMatrix();
+        rlTranslatef(t.pos.x, 5.2f, t.pos.z);
+        rlRotatef(t.turretAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+        DrawCube(Vector3{ 0, 0, 0 }, 2.6f, 1.2f, 3.4f, dark);
+        DrawCube(Vector3{ 0, 0.1f, -2.8f }, 0.45f, 0.45f, 3.6f, dark);
+        rlPopMatrix();
+        // Blinking red warning light.
+        if ((frameCount / 30) % 2 == 0)
+            DrawSphere(Vector3{ t.pos.x, 6.4f, t.pos.z }, 0.45f, RED);
+        // HP pips.
+        for (int i = 0; i < t.maxHp; ++i)
+            DrawCube(Vector3{ t.pos.x - 2.0f + i * 1.2f, 7.2f, t.pos.z }, 0.9f, 0.9f, 0.9f,
+                     i < t.hp ? GREEN : DARKGRAY);
+    }
 }
 
 static void DrawVillage(const std::vector<Building> &village) {
@@ -362,8 +549,9 @@ static Vector3 TurretForward(const Tank &t) {
     return Vector3{ sinf(a), 0.0f, -cosf(a) };  // 0 rad faces -Z
 }
 
-static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt,
-                       bool allowDrive, float maxSpeed) {
+static void UpdateTank(Tank &t, const std::vector<Building> &village,
+                       const std::vector<Ditch> &ditches, const std::vector<Bridge> &bridges,
+                       float dt, bool allowDrive, float maxSpeed, float ditchSlow) {
     float throttle = 0.0f;
     float steer = 0.0f;
     // Driving input only counts in gunner mode; in drone mode the tank
@@ -375,8 +563,11 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village, float dt,
         if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) steer += 1.0f;
     }
 
-    if (throttle > 0.0f)      t.speed = fminf(t.speed + ACCEL * dt, maxSpeed);
-    else if (throttle < 0.0f) t.speed = fmaxf(t.speed - ACCEL * dt, MAX_REVERSE);
+    // Ditches sap drive power.
+    float dm = DitchDepthAt(t.pos.x, t.pos.z, ditches, bridges) > 0.0f ? ditchSlow : 1.0f;
+    float effMax = maxSpeed * dm;
+    if (throttle > 0.0f)      t.speed = fminf(t.speed + ACCEL * dt, effMax);
+    else if (throttle < 0.0f) t.speed = fmaxf(t.speed - ACCEL * dt, MAX_REVERSE * dm);
     else {
         // Engine braking.
         if (t.speed > 0.0f)      t.speed = fmaxf(t.speed - ACCEL * 1.5f * dt, 0.0f);
@@ -600,6 +791,7 @@ struct Enemy {
     int hp = 2;
     int maxHp = 2;
     bool alive = true;
+    bool visible = true;      // fog of war: currently seen by a revealer
     float hitFlashT = 0.0f;   // white hit feedback timer
     // AI state.
     AIState aiState = AIState::ADVANCE;
@@ -704,6 +896,23 @@ static bool LosBlocked(const Vector3 &a, const Vector3 &b, const std::vector<Bui
     return false;
 }
 
+// Fog of war: is (x,z) currently visible to any revealer (player, ally,
+// drone)? Needs line of sight within the sight radius.
+static bool VisibleToRevealers(float x, float z,
+                               const std::vector<Vector3> &revealers,
+                               const std::vector<Building> &village,
+                               float radius) {
+    float r2 = radius * radius;
+    for (const auto &r : revealers) {
+        float dx = x - r.x, dz = z - r.z;
+        if (dx * dx + dz * dz > r2) continue;
+        Vector3 eye = { r.x, 2.25f, r.z };
+        Vector3 tgt = { x, 2.0f, z };
+        if (!LosBlocked(eye, tgt, village)) return true;
+    }
+    return false;
+}
+
 // Nearest building between the enemy and the player; returns a spot on the
 // far side to hide behind. Falls back to the enemy's position (no cover).
 static Vector3 PickCover(const Enemy &e, const Vector3 &playerPos,
@@ -734,6 +943,7 @@ static Vector3 PickCover(const Enemy &e, const Vector3 &playerPos,
 }
 
 static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Building> &village,
+                          const std::vector<Ditch> &ditches, const std::vector<Bridge> &bridges,
                           std::vector<Shell> &shells, std::vector<Flash> &flashes,
                           const Config &cfg, float dt) {
     if (!e.alive) return;
@@ -752,8 +962,10 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
         float diff = NormalizeAngle(wantAngle - e.hullAngle);
         e.hullAngle += Clamp(diff * 3.0f, -1.6f, 1.6f) * dt;
         float throttle = (fabsf(diff) < 0.6f) ? 1.0f : 0.25f;
-        e.pos.x += sinf(e.hullAngle) * speed * throttle * dt;
-        e.pos.z += -cosf(e.hullAngle) * speed * throttle * dt;
+        float dm = DitchDepthAt(e.pos.x, e.pos.z, ditches, bridges) > 0.0f
+            ? cfg.ditchSlowFactor : 1.0f;
+        e.pos.x += sinf(e.hullAngle) * speed * throttle * dt * dm;
+        e.pos.z += -cosf(e.hullAngle) * speed * throttle * dt * dm;
     };
 
     switch (e.aiState) {
@@ -842,7 +1054,10 @@ static void DamageBuilding(Building &b, const Vector3 &hitPos) {
 // ---------------------------------------------------------------------------
 // Deterministic scatter: clear of buildings, of the player spawn, and of
 // each other. Stationary until v0.5 AI.
-static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Building> &village) {
+static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Building> &village,
+                                       const std::vector<Ditch> &ditches,
+                                       const std::vector<Bridge> &bridges,
+                                       const std::vector<Tower> &towers) {
     std::vector<Enemy> out;
     SetRandomSeed(4242);
     int guard = 0;
@@ -859,6 +1074,9 @@ static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Bu
                 fabsf(z - b.center.z) < b.size.z * 0.5f + 5.0f) { bad = true; break; }
         }
         if (bad) continue;
+        // Not in a ditch, not inside a tower.
+        if (DitchDepthAt(x, z, ditches, bridges) > 0.0f) continue;
+        if (PointInTower(x, z, towers, 4.0f)) continue;
         // Spaced from other enemies.
         for (const auto &e : out) {
             float ex = x - e.pos.x, ez = z - e.pos.z;
@@ -983,6 +1201,7 @@ static void DamageAlly(Ally &a, std::vector<Particle> &particles, std::vector<Fl
 
 static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
                          std::vector<Enemy> &enemies, const std::vector<Building> &village,
+                         const std::vector<Ditch> &ditches, const std::vector<Bridge> &bridges,
                          std::vector<Shell> &shells, std::vector<Flash> &flashes,
                          std::vector<Particle> &particles, const Config &cfg,
                          bool inCombat, float dt) {
@@ -1020,8 +1239,10 @@ static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
             float diff = NormalizeAngle(wantAngle - a.hullAngle);
             a.hullAngle += Clamp(diff * 3.0f, -1.6f, 1.6f) * dt;
             float throttle = (fabsf(diff) < 0.6f) ? 1.0f : 0.25f;
-            a.pos.x += sinf(a.hullAngle) * speed * throttle * dt;
-            a.pos.z += -cosf(a.hullAngle) * speed * throttle * dt;
+            float dm = DitchDepthAt(a.pos.x, a.pos.z, ditches, bridges) > 0.0f
+                ? cfg.ditchSlowFactor : 1.0f;
+            a.pos.x += sinf(a.hullAngle) * speed * throttle * dt * dm;
+            a.pos.z += -cosf(a.hullAngle) * speed * throttle * dt * dm;
         };
 
         if (tgt >= 0) {
@@ -1127,6 +1348,101 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
     e.burnAccum = 0.0f;
 }
 
+// Turret towers: static defenses hostile to the player side. Track the
+// nearest of player/allies in range + LOS, aim, then fire.
+static void UpdateTowers(std::vector<Tower> &towers, const Tank &player,
+                         std::vector<Ally> &allies, const std::vector<Building> &village,
+                         std::vector<Shell> &shells, std::vector<Flash> &flashes,
+                         const Config &cfg, float dt) {
+    for (auto &t : towers) {
+        if (!t.alive) continue;
+        if (t.hitFlashT > 0.0f) t.hitFlashT -= dt;
+        t.fireTimer += dt;
+
+        // Pick target: nearest of player / alive allies in range with LOS.
+        float bestD2 = cfg.towerRange * cfg.towerRange;
+        Vector3 teye = { t.pos.x, 5.5f, t.pos.z };
+        bool tp = false; int ta = -1;
+        Vector3 tgtPos = { 0, 0, 0 };
+        if (player.hp > 0) {
+            float dx = player.pos.x - t.pos.x, dz = player.pos.z - t.pos.z;
+            float d2 = dx * dx + dz * dz;
+            Vector3 pp = { player.pos.x, 2.0f, player.pos.z };
+            if (d2 < bestD2 && !LosBlocked(teye, pp, village)) {
+                bestD2 = d2; tp = true; tgtPos = pp;
+            }
+        }
+        for (size_t i = 0; i < allies.size(); ++i) {
+            if (!allies[i].alive) continue;
+            float dx = allies[i].pos.x - t.pos.x, dz = allies[i].pos.z - t.pos.z;
+            float d2 = dx * dx + dz * dz;
+            Vector3 ap = { allies[i].pos.x, 2.0f, allies[i].pos.z };
+            if (d2 < bestD2 && !LosBlocked(teye, ap, village)) {
+                bestD2 = d2; tp = false; ta = (int)i; tgtPos = ap;
+            }
+        }
+
+        if (bestD2 >= cfg.towerRange * cfg.towerRange) {
+            t.targetPlayer = false; t.targetAlly = -1; t.aimTimer = 0.0f;
+            continue;
+        }
+        t.targetPlayer = tp; t.targetAlly = ta;
+        float want = atan2f(tgtPos.x - t.pos.x, -(tgtPos.z - t.pos.z));
+        float diff = NormalizeAngle(want - t.turretAngle);
+        t.turretAngle += Clamp(diff * 2.5f, -1.2f, 1.2f) * dt;
+        if (fabsf(diff) < 0.08f) t.aimTimer += dt; else t.aimTimer = 0.0f;
+        if (t.aimTimer >= cfg.towerAimTime && t.fireTimer >= cfg.towerFireInt) {
+            // Fire.
+            Vector3 fwd = { sinf(t.turretAngle), 0.0f, -cosf(t.turretAngle) };
+            float spread = ((float)GetRandomValue(-100, 100) / 100.0f) * 0.05f;
+            float fa = t.turretAngle + spread;
+            fwd = { sinf(fa), 0.0f, -cosf(fa) };
+            Vector3 muzzle = { t.pos.x + fwd.x * 3.0f, 5.2f, t.pos.z + fwd.z * 3.0f };
+            Shell s;
+            s.pos = muzzle;
+            s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+            s.life = cfg.shellLifetime;
+            s.fromEnemy = true;  // hits player + allies
+            shells.push_back(s);
+            flashes.push_back(Flash{ muzzle, 0.25f, 0.25f, 1.0f });
+            t.fireTimer = 0.0f; t.aimTimer = 0.0f;
+        }
+    }
+}
+
+static bool ShellHitsTower(const Vector3 &p, float r, const Tower &t) {
+    if (!t.alive) return false;
+    float dx = p.x - t.pos.x, dz = p.z - t.pos.z;
+    float rr = 3.6f + r;
+    return dx * dx + dz * dz < rr * rr && p.y < 7.0f;
+}
+
+static void DamageTower(Tower &t, std::vector<Particle> &particles,
+                        std::vector<Flash> &flashes) {
+    if (!t.alive) return;
+    t.hitFlashT = 0.18f;
+    if (--t.hp > 0) return;
+    t.alive = false;
+    Vector3 c = { t.pos.x, 3.0f, t.pos.z };
+    flashes.push_back(Flash{ c, 0.6f, 0.6f, 4.0f });
+    Burst(particles, c, 26, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 1.0f, 0.9f, 7.0f);
+    Burst(particles, c, 14, Color{ 80, 80, 85, 255 }, 5.0f, 4.0f, 1.4f, 1.2f, 5.0f);
+}
+
+// Push a position out of live tower bases.
+static void ResolveTowerCollisions(Vector3 &pos, const std::vector<Tower> &towers) {
+    for (const auto &t : towers) {
+        if (!t.alive) continue;
+        float dx = pos.x - t.pos.x, dz = pos.z - t.pos.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < 3.6f * 3.6f && d2 > 1e-4f) {
+            float d = sqrtf(d2);
+            pos.x = t.pos.x + dx / d * 3.6f;
+            pos.z = t.pos.z + dz / d * 3.6f;
+        }
+    }
+}
+
 static void UpdateEnemies(std::vector<Enemy> &enemies, std::vector<Particle> &particles, float dt) {
     for (auto &e : enemies) {
         if (e.hitFlashT > 0.0f) e.hitFlashT -= dt;
@@ -1190,6 +1506,7 @@ static void ResolveWreckCollisions(Vector3 &pos, const std::vector<Enemy> &enemi
 static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
     static const Color CHARRED = { 38, 33, 28, 255 };
     for (const auto &e : enemies) {
+        if (e.alive && !e.visible) continue;  // fog of war
         if (e.alive) {
             Color armor = cfg.enemyColor;
             if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
@@ -1268,6 +1585,9 @@ static void DrawMinimap(RenderTexture2D target, const Tank &tank,
                         const std::vector<Ally> &allies,
                         const std::vector<Enemy> &enemies,
                         const std::vector<Building> &village,
+                        const std::vector<Ditch> &ditches,
+                        const std::vector<Bridge> &bridges,
+                        const std::vector<Tower> &towers,
                         const std::vector<Shell> &shells,
                         const Config &cfg, Phase phase,
                         int screenWidth, int screenHeight) {
@@ -1284,6 +1604,16 @@ static void DrawMinimap(RenderTexture2D target, const Tank &tank,
     BeginMode3D(mc);
     DrawPlane(Vector3{ tank.pos.x, 0.0f, tank.pos.z }, Vector2{ 500.0f, 500.0f },
               Color{ 40, 55, 40, 255 });
+    // Ditches read as dark scars; bridges and towers as markers.
+    for (const auto &d : ditches)
+        DrawPlane(Vector3{ d.center.x, 0.1f, d.center.z },
+                  Vector2{ d.hx * 2, d.hz * 2 }, Color{ 30, 22, 15, 255 });
+    for (const auto &b : bridges)
+        DrawCube(Vector3{ b.center.x, 0.5f, b.center.z }, b.hx * 2, 1.0f, b.hz * 2,
+                 Color{ 150, 120, 80, 255 });
+    for (const auto &t : towers)
+        DrawCube(Vector3{ t.pos.x, 1.0f, t.pos.z }, 5.0f, 2.0f, 5.0f,
+                 t.alive ? Color{ 90, 90, 95, 255 } : Color{ 50, 50, 50, 255 });
     for (const auto &b : village) {
         if (b.destroyed)
             DrawCube(Vector3{ b.center.x, 0.5f, b.center.z },
@@ -1304,10 +1634,10 @@ static void DrawMinimap(RenderTexture2D target, const Tank &tank,
     marker(tank.pos, tank.hullAngle, GREEN);
     for (const auto &a : allies)
         if (a.alive) marker(a.pos, a.hullAngle, cfg.allyColor);
-    // Enemies stay hidden during SETUP.
+    // Enemies stay hidden during SETUP, and by fog of war.
     if (phase == Phase::COMBAT)
         for (const auto &e : enemies)
-            if (e.alive) marker(e.pos, e.hullAngle, cfg.enemyColor);
+            if (e.alive && e.visible) marker(e.pos, e.hullAngle, cfg.enemyColor);
     for (const auto &s : shells) DrawSphere(s.pos, 1.2f, YELLOW);
     EndMode3D();
     EndTextureMode();
@@ -1326,11 +1656,14 @@ static void DrawChaseView(RenderTexture2D target, const Tank &tank,
                           const std::vector<Ally> &allies,
                           const std::vector<Enemy> &enemies,
                           const std::vector<Building> &village,
+                          const std::vector<Ditch> &ditches,
+                          const std::vector<Bridge> &bridges,
+                          const std::vector<Tower> &towers,
                           const std::vector<Shell> &shells,
                           const std::vector<Flash> &flashes,
                           const std::vector<Particle> &particles,
                           const Config &cfg, Phase phase, int selectedAlly,
-                          int screenWidth, int screenHeight) {
+                          int screenWidth, int screenHeight, int frameCount) {
     int W = cfg.chaseWidth, H = cfg.chaseHeight;
     Vector3 behind = { -sinf(tank.hullAngle), 0.0f, cosf(tank.hullAngle) };
     Camera3D cc = {};
@@ -1345,10 +1678,11 @@ static void DrawChaseView(RenderTexture2D target, const Tank &tank,
     BeginTextureMode(target);
     ClearBackground(SKYBLUE);
     BeginMode3D(cc);
-    DrawPlane(Vector3{ 0, 0, 0 }, Vector2{ ARENA_HALF * 2 + 40, ARENA_HALF * 2 + 40 },
-              Color{ 168, 148, 118, 255 });
+    DrawGround(ditches);
     DrawGrid(40, 20.0f);
+    DrawBridges(bridges);
     DrawVillage(village);
+    DrawTowers(towers, frameCount);
     DrawTank(tank, false);  // solid, never the gunner ghost
     if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
     DrawAllies(allies, enemies, cfg, selectedAlly);
@@ -1390,11 +1724,19 @@ int main() {
     Config cfg = LoadConfig();
     RenderTexture2D minimapTarget = LoadRenderTexture(cfg.minimapSize, cfg.minimapSize);
     RenderTexture2D chaseTarget = LoadRenderTexture(cfg.chaseWidth, cfg.chaseHeight);
-    std::vector<Building> village = BuildVillage(cfg.buildingHits);
-    std::vector<Enemy> enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
+
+    std::vector<GameMap> maps = BuildMaps(cfg.ditchDepth);
+    int mapIdx = 0;
+    for (size_t i = 0; i < maps.size(); ++i)
+        if (maps[i].name == cfg.mapDefault) mapIdx = (int)i;
+
     Tank tank;
-    tank.hp = tank.maxHp = cfg.playerHits;
-    std::vector<Ally> allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
+    std::vector<Building> village;
+    std::vector<Enemy> enemies;
+    std::vector<Ally> allies;
+    std::vector<Ditch> ditches;
+    std::vector<Bridge> bridges;
+    std::vector<Tower> towers;
     int selectedAlly = 0;
     std::vector<Shell> shells;
     std::vector<Flash> flashes;
@@ -1404,15 +1746,46 @@ int main() {
     // Battle stats (reset on R, battleStart set on ENTER).
     int shotsFired = 0, shotsHit = 0, playerKills = 0;
     double battleStart = 0.0;
+    double battleEnd = 0.0;
     DroneCam drone;
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
     // and position allies before combat.
     CamMode mode = CamMode::DRONE;
     Phase phase = Phase::SETUP;
-    ResetDroneView(drone, tank);
-    EnableCursor();
     bool gameOver = false;
+
+    // (Re)build everything for maps[mapIdx]: village, terrain, towers,
+    // player, enemies, allies. Used at startup, on R, and on map change.
+    auto loadMap = [&]() {
+        const GameMap &m = maps[mapIdx];
+        village = BuildVillage(cfg.buildingHits, m.villageSeed);
+        ditches = m.ditches;
+        bridges = m.bridges;
+        towers.clear();
+        for (const auto &tp : m.towerPos) {
+            Tower t;
+            t.pos = tp;
+            t.hp = t.maxHp = cfg.towerHits;
+            towers.push_back(t);
+        }
+        tank = Tank{};
+        tank.hp = tank.maxHp = cfg.playerHits;
+        enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village, ditches, bridges, towers);
+        allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
+        selectedAlly = 0;
+        shells.clear(); flashes.clear(); particles.clear(); pings.clear();
+        fireCooldown = 0.0f;
+        shotsFired = 0; shotsHit = 0; playerKills = 0;
+        battleStart = 0.0;
+        battleEnd = 0.0;
+        mode = CamMode::DRONE;
+        ResetDroneView(drone, tank);
+        EnableCursor();
+        phase = Phase::SETUP;
+        gameOver = false;
+    };
+    loadMap();
     Camera3D camera = {};
     camera.position = Vector3{ 0.0f, 10.0f, 10.0f };
     camera.target = Vector3{ 0.0f, 0.0f, 0.0f };
@@ -1433,23 +1806,14 @@ int main() {
         int aliveNow = 0;
         for (const auto &e : enemies) if (e.alive) ++aliveNow;
         if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
-            // Restart: fresh village, enemies, allies, player. Back to SETUP
-            // in drone mode.
-            tank = Tank{};
-            tank.hp = tank.maxHp = cfg.playerHits;
-            village = BuildVillage(cfg.buildingHits);
-            enemies = SpawnEnemies(cfg.enemyCount, cfg.enemyHits, village);
-            allies = SpawnAllies(cfg.allyCount, cfg.allyHits, tank.pos);
-            selectedAlly = 0;
-            shells.clear(); flashes.clear(); particles.clear(); pings.clear();
-            fireCooldown = 0.0f;
-            shotsFired = 0; shotsHit = 0; playerKills = 0;
-            battleStart = 0.0;
-            mode = CamMode::DRONE;
-            ResetDroneView(drone, tank);
-            EnableCursor();
-            phase = Phase::SETUP;
-            gameOver = false;
+            // Restart: reload the current map, back to SETUP in drone mode.
+            loadMap();
+        }
+
+        // M cycles maps in the setup phase.
+        if (phase == Phase::SETUP && IsKeyPressed(KEY_M)) {
+            mapIdx = (mapIdx + 1) % (int)maps.size();
+            loadMap();
         }
 
         // ENTER starts the battle from the setup phase and drops the player
@@ -1459,6 +1823,7 @@ int main() {
             mode = CamMode::GUNNER;
             DisableCursor();
             battleStart = GetTime();
+            battleEnd = 0.0;
         }
 
         if (!gameOver) {
@@ -1503,7 +1868,8 @@ int main() {
             }
         }
 
-        UpdateTank(tank, village, dt, mode == CamMode::GUNNER, cfg.playerSpeed);
+        UpdateTank(tank, village, ditches, bridges, dt, mode == CamMode::GUNNER,
+                   cfg.playerSpeed, cfg.ditchSlowFactor);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 
         fireCooldown -= dt;
@@ -1556,7 +1922,10 @@ int main() {
                         Vector3 hc = { tank.pos.x, 1.6f, tank.pos.z };
                         flashes.push_back(Flash{ hc, 0.4f, 0.4f, 2.5f });
                         Burst(particles, hc, 8, Color{ 255, 150, 40, 255 }, 7.0f, 6.0f, 0.7f, 0.6f, 6.0f);
-                        if (tank.hp <= 0) gameOver = true;
+                        if (tank.hp <= 0) {
+                            gameOver = true;
+                            battleEnd = GetTime();
+                        }
                         dead = true;
                     }
                     if (!dead) {
@@ -1584,6 +1953,17 @@ int main() {
                             break;
                         }
                     }
+                    // Towers are hard targets for player/ally shells.
+                    if (!dead) {
+                        for (auto &t : towers) {
+                            if (ShellHitsTower(it->pos, cfg.shellRadius, t)) {
+                                DamageTower(t, particles, flashes);
+                                flashes.push_back(Flash{ it->pos, 0.25f, 0.25f, 2.0f });
+                                dead = true;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             it = dead ? shells.erase(it) : std::next(it);
@@ -1593,13 +1973,35 @@ int main() {
         // Hidden and inert during SETUP: they spawn when combat begins.
         if (phase == Phase::COMBAT) {
             for (auto &e : enemies)
-                UpdateEnemyAI(e, tank, village, shells, flashes, cfg, dt);
+                UpdateEnemyAI(e, tank, village, ditches, bridges, shells, flashes, cfg, dt);
+            UpdateTowers(towers, tank, allies, village, shells, flashes, cfg, dt);
         }
         UpdateEnemies(enemies, particles, dt);
         // Ally AI (orders + engage) + death animations. In SETUP allies
         // follow orders but do not engage hidden enemies.
-        UpdateAllies(allies, tank, enemies, village, shells, flashes, particles,
+        UpdateAllies(allies, tank, enemies, village, ditches, bridges, shells, flashes, particles,
                      cfg, phase == Phase::COMBAT, dt);
+        // Ditch sink: tanks drop to the ditch floor.
+        tank.pos.y = -DitchDepthAt(tank.pos.x, tank.pos.z, ditches, bridges);
+        for (auto &e : enemies) e.pos.y = -DitchDepthAt(e.pos.x, e.pos.z, ditches, bridges);
+        for (auto &a : allies) a.pos.y = -DitchDepthAt(a.pos.x, a.pos.z, ditches, bridges);
+        // Towers block movement.
+        ResolveTowerCollisions(tank.pos, towers);
+        for (auto &e : enemies) ResolveTowerCollisions(e.pos, towers);
+        for (auto &a : allies) ResolveTowerCollisions(a.pos, towers);
+        // Fog of war: enemy visibility from revealers (player, allies, drone).
+        if (phase == Phase::COMBAT && cfg.fogEnabled) {
+            std::vector<Vector3> revealers;
+            revealers.push_back(tank.pos);
+            for (const auto &a : allies) if (a.alive) revealers.push_back(a.pos);
+            revealers.push_back(drone.pos);
+            for (auto &e : enemies) {
+                e.visible = e.alive && VisibleToRevealers(e.pos.x, e.pos.z, revealers,
+                                                          village, cfg.fogSightRadius);
+            }
+        } else if (!cfg.fogEnabled) {
+            for (auto &e : enemies) e.visible = e.alive;
+        }
         // Wrecks block enemies too; enemies keep separation from each other.
         for (auto &e : enemies) {
             if (!e.alive) continue;
@@ -1727,13 +2129,14 @@ int main() {
         ClearBackground(SKYBLUE);
 
         BeginMode3D(camera);
-        // Ground: dusty plain with a street grid feel.
-        DrawPlane(Vector3{ 0, 0, 0 }, Vector2{ ARENA_HALF * 2 + 40, ARENA_HALF * 2 + 40 },
-                  Color{ 168, 148, 118, 255 });
+        // Ground with ditch pits, street grid, bridges, towers.
+        DrawGround(ditches);
         DrawGrid(40, 20.0f);
+        DrawBridges(bridges);
         DrawVillage(village);
+        DrawTowers(towers, frameCount);
         DrawTank(tank, mode == CamMode::GUNNER);
-        // Enemies are hidden until combat begins.
+        // Enemies are hidden until combat begins, and by fog of war.
         if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
         DrawAllies(allies, enemies, cfg, selectedAlly);
         // Drone-mode mouse cursor: ring + crosshair on the ground.
@@ -1784,17 +2187,19 @@ int main() {
 
         // Minimap (gunner mode): top-down view following the player tank.
         if (mode == CamMode::GUNNER && cfg.minimapEnabled)
-            DrawMinimap(minimapTarget, tank, allies, enemies, village, shells,
-                        cfg, phase, screenWidth, screenHeight);
+            DrawMinimap(minimapTarget, tank, allies, enemies, village, ditches, bridges,
+                        towers, shells, cfg, phase, screenWidth, screenHeight);
         // Chase drone view above the minimap: follow-cam on the player tank.
         if (mode == CamMode::GUNNER && cfg.chaseEnabled)
-            DrawChaseView(chaseTarget, tank, allies, enemies, village, shells,
-                          flashes, particles, cfg, phase, selectedAlly,
-                          screenWidth, screenHeight);
+            DrawChaseView(chaseTarget, tank, allies, enemies, village, ditches, bridges,
+                          towers, shells, flashes, particles, cfg, phase, selectedAlly,
+                          screenWidth, screenHeight, frameCount);
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("[%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
+        DrawText(TextFormat("Map: %s", maps[mapIdx].name.c_str()),
+                 screenWidth - 360, 12, 20, DARKGRAY);
         if (mode == CamMode::GUNNER){
             // D-pad cross: WASD + arrow labels on the arms (drive controls).
             int dx = 16, dy = 36, s = 34;
@@ -1903,19 +2308,20 @@ int main() {
         }
         // SETUP overlay: position forces, see the map, then start the battle.
         if (phase == Phase::SETUP) {
-            int pw = 640, ph = 300;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
+            int pw = 540, ph = 260;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
             DrawRectangle(px, py, pw, ph, Color{ 10, 10, 20, 220 });
             DrawRectangleLines(px, py, pw, ph, SKYBLUE);
             int tx = px + 24, ty = py + 20;
             DrawText("SETUP PHASE", tx, ty, 30, SKYBLUE);
             ty += 42;
+            DrawText(TextFormat("Map: %s   (M to change)", maps[mapIdx].name.c_str()),
+                     tx, ty, 20, YELLOW);
+            ty += 30;
             DrawText(TextFormat("Enemy armor inbound: %d tanks (positions unknown)", cfg.enemyCount),
                      tx, ty, 20, RED);
             ty += 34;
             DrawText("Position your forces before the battle begins:", tx, ty, 20, WHITE);
-            ty += 30;
-            DrawText("- TAB: switch between GUNNER and DRONE view", tx, ty, 18, LIGHTGRAY);
             ty += 26;
             if (mode == CamMode::DRONE) {
                 DrawText("- Move the mouse to aim the cursor", tx, ty, 18, LIGHTGRAY);
@@ -1925,8 +2331,8 @@ int main() {
                 DrawText("- Right-click enemy: order ally to attack it", tx, ty, 18, LIGHTGRAY);
                 ty += 26;
                 DrawText("- 1/2 select ally,  F follow,  H hold position", tx, ty, 18, LIGHTGRAY);
-                ty += 26;
-                DrawText("- Arrows rotate drone,  WASD/QE move drone", tx, ty, 18, LIGHTGRAY);
+                // ty += 26;
+                // DrawText("- Arrows rotate drone,  WASD/QE move drone", tx, ty, 18, LIGHTGRAY);
                 ty += 36;
             }
             if ((frameCount / 30) % 2 == 0)
@@ -1949,7 +2355,7 @@ int main() {
         }
         // Shared end-of-battle stats lines.
         auto battleStats = [&](int tx, int ty, int lh, Color c) {
-            int secs = battleStart > 0.0 ? (int)(GetTime() - battleStart) : 0;
+            int secs = battleStart > 0.0 ? (int)(battleEnd > 0.0 ? (int)(battleEnd - battleStart) : 0) : 0 ;
             int destroyed = cfg.enemyCount - aliveCount;
             float acc = shotsFired > 0 ? 100.0f * shotsHit / shotsFired : 0.0f;
             DrawText(TextFormat("Time  %d:%02d", secs / 60, secs % 60), tx, ty, 20, c);
@@ -1960,8 +2366,8 @@ int main() {
                      tx, ty + lh * 3, 20, c);
         };
         if (gameOver) {
-            int pw = 460, ph = 330;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
+            int pw = 360, ph = 230;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
             DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
             DrawRectangle(px, py, pw, ph, Color{ 20, 8, 8, 235 });
             DrawRectangleLines(px, py, pw, ph, RED);
@@ -1972,8 +2378,9 @@ int main() {
             if ((frameCount / 30) % 2 == 0)
                 DrawText("Press R to retry", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
         } else if (aliveCount == 0 && phase == Phase::COMBAT) {
-            int pw = 460, ph = 330;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 5;
+            if (battleEnd == 0.0) battleEnd = GetTime();
+            int pw = 360, ph = 230;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
             DrawRectangle(px, py, pw, ph, Color{ 8, 20, 12, 235 });
             DrawRectangleLines(px, py, pw, ph, GREEN);
             int tx = px + 30, ty = py + 24;

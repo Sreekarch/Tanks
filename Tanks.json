@@ -28,7 +28,7 @@
       "g": 70,
       "r": 165
     },
-    "count": 4,
+    "count": 6,
     "coverWaitTime": 4.0,
     "fireInterval": 3.5,
     "hitsToDestroy": 2,
@@ -57,5 +57,22 @@
     "height": 180,
     "camHeight": 26.0,
     "camDistance": 30.0
+  },
+  "fog": {
+    "enabled": true,
+    "sightRadius": 90.0
+  },
+  "ditch": {
+    "slowFactor": 0.15,
+    "depth": 3.0
+  },
+  "tower": {
+    "hitsToDestroy": 3,
+    "shootRange": 75.0,
+    "fireInterval": 4.0,
+    "aimTime": 1.0
+  },
+  "map": {
+    "default": "Crossroads"
   }
 }

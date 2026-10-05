@@ -28,7 +28,7 @@
       "g": 70,
       "r": 165
     },
-    "count": 6,
+    "count": 10,
     "coverWaitTime": 4.0,
     "fireInterval": 3.5,
     "hitsToDestroy": 2,
@@ -60,7 +60,14 @@
   },
   "fog": {
     "enabled": true,
-    "sightRadius": 90.0
+    "sightRadius": 90.0,
+    "edgeWidth": 14.0,
+    "puffAlpha": 0.32,
+    "puffSize": 22.0
+  },
+  "replay": {
+    "enabled": true,
+    "durationSeconds": 10.0
   },
   "ditch": {
     "slowFactor": 0.15,

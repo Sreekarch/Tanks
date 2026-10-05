@@ -13,8 +13,10 @@
 #include "raymath.h"
 #include "rlgl.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -59,6 +61,11 @@ struct Config {
     // Fog of war (hides enemies outside line of sight)
     bool  fogEnabled       = true;
     float fogSightRadius   = 90.0f;  // revealers see this far (with LOS)
+    float fogEdgeWidth     = 14.0f;  // soft reveal band around the sight radius
+    float fogPuffAlpha     = 0.32f;  // per-puff alpha of the visible fog banks
+    float fogPuffSize      = 22.0f;  // world-unit diameter of one fog puff
+    bool  replayEnabled    = true;   // defeat replays the last seconds
+    float replayDuration   = 10.0f;  // seconds of replay footage
     // Ditches (tanks get stuck/slowed) and bridges
     float ditchSlowFactor  = 0.15f;  // speed multiplier inside a ditch
     float ditchDepth       = 3.0f;
@@ -142,6 +149,12 @@ static Config LoadConfig() {
         auto fg = j.value("fog", nlohmann::json::object());
         c.fogEnabled     = fg.value("enabled", c.fogEnabled);
         c.fogSightRadius = fg.value("sightRadius", c.fogSightRadius);
+        c.fogEdgeWidth   = fg.value("edgeWidth", c.fogEdgeWidth);
+        c.fogPuffAlpha   = fg.value("puffAlpha", c.fogPuffAlpha);
+        c.fogPuffSize    = fg.value("puffSize", c.fogPuffSize);
+        auto rp = j.value("replay", nlohmann::json::object());
+        c.replayEnabled  = rp.value("enabled", c.replayEnabled);
+        c.replayDuration = rp.value("durationSeconds", c.replayDuration);
         auto dt2 = j.value("ditch", nlohmann::json::object());
         c.ditchSlowFactor = dt2.value("slowFactor", c.ditchSlowFactor);
         c.ditchDepth      = dt2.value("depth", c.ditchDepth);
@@ -152,7 +165,9 @@ static Config LoadConfig() {
         c.towerAimTime = tw.value("aimTime", c.towerAimTime);
         auto mp = j.value("map", nlohmann::json::object());
         std::string md = mp.value("default", std::string(c.mapDefault));
+        // Portable copy (strncpy_s is MSVC-only); always null-terminate.
         strncpy_s(c.mapDefault, md.c_str(), sizeof(c.mapDefault) - 1);
+        c.mapDefault[sizeof(c.mapDefault) - 1] = '\0';
     } catch (...) { /* keep defaults */ }
     return c;
 }
@@ -588,10 +603,15 @@ static void UpdateTank(Tank &t, const std::vector<Building> &village,
 
 // Hull mesh shared by the player and enemies. armor is the base color;
 // the deck is derived lighter, treads/drums stay fixed.
-static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor) {
+static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor, float alpha = 1.0f) {
+    unsigned char a = (unsigned char)(255.0f * fmaxf(0.0f, fminf(1.0f, alpha)));
+    Color body = armor; body.a = a;
     Color deck = { (unsigned char)fminf(armor.r * 1.14f, 255.0f),
                    (unsigned char)fminf(armor.g * 1.14f, 255.0f),
-                   (unsigned char)fminf(armor.b * 1.14f, 255.0f), 255 };
+                   (unsigned char)fminf(armor.b * 1.14f, 255.0f), a };
+    Color treadC = { 45, 48, 44, a };
+    Color lightC = { 255, 240, 200, a };
+    Color drumC  = { 130, 75, 45, a };
     Vector3 hullC = { pos.x, 0.75f, pos.z };
 
     rlPushMatrix();
@@ -599,20 +619,20 @@ static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor) {
     // NOTE: negated — rlRotatef(+a) about Y turns local -Z toward -X, but our
     // angle convention faces (sin a, 0, -cos a), i.e. toward +X for a > 0.
     rlRotatef(-hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    DrawCube(Vector3{ 0, 0, 0 }, 3.2f, 1.1f, 4.6f, armor);                         // hull
-    DrawCube(Vector3{ 0, 0.75f, -0.4f }, 2.4f, 0.5f, 2.6f, deck);                  // upper deck
-    DrawCube(Vector3{ -1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, Color{ 45, 48, 44, 255 }); // treads
-    DrawCube(Vector3{ 1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, Color{ 45, 48, 44, 255 });
+    DrawCube(Vector3{ 0, 0, 0 }, 3.2f, 1.1f, 4.6f, body);                            // hull
+    DrawCube(Vector3{ 0, 0.75f, -0.4f }, 2.4f, 0.5f, 2.6f, deck);                   // upper deck
+    DrawCube(Vector3{ -1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, treadC);              // treads
+    DrawCube(Vector3{ 1.85f, -0.15f, 0 }, 0.7f, 0.9f, 4.8f, treadC);
     // Forward/back cues so the gunner can read hull direction at a glance:
     // headlights on the nose, and two external
     // fuel drums on the rear deck (the back of the tank, Soviet-style).
-    DrawCube(Vector3{ -0.9f, 0.6f, -2.33f }, 0.25f, 0.2f, 0.1f, Color{ 255, 240, 200, 255 }); // headlight L
-    DrawCube(Vector3{  0.9f, 0.6f, -2.33f }, 0.25f, 0.2f, 0.1f, Color{ 255, 240, 200, 255 }); // headlight R
+    DrawCube(Vector3{ -0.9f, 0.6f, -2.33f }, 0.25f, 0.2f, 0.1f, lightC); // headlight L
+    DrawCube(Vector3{  0.9f, 0.6f, -2.33f }, 0.25f, 0.2f, 0.1f, lightC); // headlight R
     for (float dx : { -0.7f, 0.7f }) {
         rlPushMatrix();
         rlTranslatef(dx, 0.83f, 1.6f);
         rlRotatef(90.0f, 0.0f, 0.0f, 1.0f);
-        DrawCylinder(Vector3{ 0, 0, 0 }, 0.28f, 0.28f, 0.9f, 10, Color{ 130, 75, 45, 255 }); // fuel drum
+        DrawCylinder(Vector3{ 0, 0, 0 }, 0.28f, 0.28f, 0.9f, 10, drumC); // fuel drum
         rlPopMatrix();
     }
     rlPopMatrix();
@@ -620,7 +640,8 @@ static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor) {
 
 // Barrel only. In gunner view the turret body is a translucent ghost but the
 // gun itself stays solid — the gunner needs to see where it's pointing.
-static void DrawTankBarrel(const Vector3 &center, float totalAngle) {
+static void DrawTankBarrel(const Vector3 &center, float totalAngle, float alpha = 1.0f) {
+    unsigned char a = (unsigned char)(255.0f * fmaxf(0.0f, fminf(1.0f, alpha)));
     rlPushMatrix();
     rlTranslatef(center.x, center.y, center.z);
     rlRotatef(-totalAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
@@ -630,7 +651,7 @@ static void DrawTankBarrel(const Vector3 &center, float totalAngle) {
     rlPushMatrix();
     rlTranslatef(0.0f, 0.0f, -1.3f);
     rlRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
-    DrawCylinder(Vector3{ 0, 0, 0 }, 0.15f, 0.15f, 2.0f, 12, Color{ 50, 52, 48, 255 });
+    DrawCylinder(Vector3{ 0, 0, 0 }, 0.15f, 0.15f, 2.0f, 12, Color{ 50, 52, 48, a });
     rlPopMatrix();
     rlPopMatrix();
 }
@@ -638,15 +659,18 @@ static void DrawTankBarrel(const Vector3 &center, float totalAngle) {
 // Turret mesh (cylinder + barrel) centered at `center` (world), rotated by
 // totalAngle = hullAngle + turretAngle. Used attached for player/enemies,
 // and detached (with a spin) for a popped wreck turret.
-static void DrawTankTurret(const Vector3 &center, float totalAngle, Color armor) {
+static void DrawTankTurret(const Vector3 &center, float totalAngle, Color armor,
+                           float alpha = 1.0f) {
+    unsigned char a = (unsigned char)(255.0f * fmaxf(0.0f, fminf(1.0f, alpha)));
+    Color body = armor; body.a = a;
     rlPushMatrix();
     rlTranslatef(center.x, center.y, center.z);
     rlRotatef(-totalAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
     // NOTE: DrawCylinder's position is its BASE: base at -0.35 puts the
     // 0.7-tall cylinder spanning y -0.35..+0.35 around the center.
-    DrawCylinder(Vector3{ 0, -0.35f, 0 }, 1.15f, 1.35f, 0.7f, 12, armor);
+    DrawCylinder(Vector3{ 0, -0.35f, 0 }, 1.15f, 1.35f, 0.7f, 12, body);
     rlPopMatrix();
-    DrawTankBarrel(center, totalAngle);
+    DrawTankBarrel(center, totalAngle, alpha);
 }
 
 static void DrawTank(const Tank &t, bool gunnerView) {
@@ -766,6 +790,38 @@ struct OrderPing {
     Color color;
 };
 
+// Death replay: ring buffer of world snapshots (20 Hz, ~15 s) so the
+// defeat screen can replay the last seconds from the drone's point of view.
+// Only the visual state is recorded — positions, damage, death anims.
+struct ReplayTankSnap {
+    Vector3 pos; float hullAngle, turretAngle; bool alive;
+    float deathT; Vector3 turretPos; float turretSpin;  // ally wrecks
+};
+struct ReplayEnemySnap {
+    Vector3 pos; float hullAngle, turretAngle; bool alive;
+    float deathT; Vector3 turretPos; float turretSpin;
+};
+struct ReplayShellSnap { Vector3 pos; };
+struct ReplayFlashSnap { Vector3 pos; float t, maxT, size; };
+struct ReplayParticleSnap { Vector3 pos; Color color; float size; float life, maxLife; };
+struct ReplayBldSnap { bool destroyed; float collapseT; int hp; Vector3 fallAxis; };
+struct ReplayTowerSnap { bool alive; float turretAngle; };
+struct ReplayFrame {
+    float time = 0.0f;
+    ReplayTankSnap player;
+    std::vector<ReplayTankSnap> allies;
+    std::vector<ReplayEnemySnap> enemies;
+    std::vector<ReplayShellSnap> shells;
+    std::vector<ReplayFlashSnap> flashes;
+    std::vector<ReplayParticleSnap> particles;
+    std::vector<ReplayBldSnap> buildings;
+    std::vector<ReplayTowerSnap> towers;
+    // Follow-drone camera (chase-view framing), recomputed per snapshot so
+    // the player's tank and its destruction stay in frame.
+    Vector3 camPos;
+    Vector3 camTarget;
+};
+
 // Lightweight particle for explosions, smoke, and fire. No pooling —
 // counts stay small (a kill bursts ~15), so a vector is fine.
 struct Particle {
@@ -791,7 +847,7 @@ struct Enemy {
     int hp = 2;
     int maxHp = 2;
     bool alive = true;
-    bool visible = true;      // fog of war: currently seen by a revealer
+    float fogFactor = 0.0f;   // fog of war: 0 = revealed, 1 = fully fogged
     float hitFlashT = 0.0f;   // white hit feedback timer
     // AI state.
     AIState aiState = AIState::ADVANCE;
@@ -896,21 +952,30 @@ static bool LosBlocked(const Vector3 &a, const Vector3 &b, const std::vector<Bui
     return false;
 }
 
-// Fog of war: is (x,z) currently visible to any revealer (player, ally,
-// drone)? Needs line of sight within the sight radius.
-static bool VisibleToRevealers(float x, float z,
-                               const std::vector<Vector3> &revealers,
-                               const std::vector<Building> &village,
-                               float radius) {
-    float r2 = radius * radius;
+// Fog of war: how fogged is (x,z)? 0 = fully revealed, 1 = fully fogged.
+// Each revealer (player, ally, drone) clears a soft disk: fully clear
+// inside sightRadius - edge/2, fully fogged beyond sightRadius + edge/2,
+// smoothstepped between. Intact buildings block a revealer's sight, so the
+// area behind them stays fogged. The cheapest revealer (by distance past
+// the radius) wins, so overlapping disks merge seamlessly.
+static float FogFactorAt(float x, float z,
+                         const std::vector<Vector3> &revealers,
+                         const std::vector<Building> &village,
+                         float radius, float edge) {
+    float best = 1e18f;  // min over revealers of (dist - radius)
     for (const auto &r : revealers) {
         float dx = x - r.x, dz = z - r.z;
-        if (dx * dx + dz * dz > r2) continue;
+        float excess = sqrtf(dx * dx + dz * dz) - radius;
+        if (excess >= best) continue;  // can't beat the current best; skip LOS
         Vector3 eye = { r.x, 2.25f, r.z };
         Vector3 tgt = { x, 2.0f, z };
-        if (!LosBlocked(eye, tgt, village)) return true;
+        if (LosBlocked(eye, tgt, village)) continue;
+        best = excess;
     }
-    return false;
+    if (best > 1e17f) return 1.0f;  // no revealer has line of sight
+    float t = (best + edge * 0.5f) / edge;
+    t = fmaxf(0.0f, fminf(1.0f, t));
+    return t * t * (3.0f - 2.0f * t);
 }
 
 // Nearest building between the enemy and the player; returns a spot on the
@@ -1353,10 +1418,13 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
 static void UpdateTowers(std::vector<Tower> &towers, const Tank &player,
                          std::vector<Ally> &allies, const std::vector<Building> &village,
                          std::vector<Shell> &shells, std::vector<Flash> &flashes,
-                         const Config &cfg, float dt) {
+                         const Config &cfg, float dt, bool victory) {
     for (auto &t : towers) {
         if (!t.alive) continue;
         if (t.hitFlashT > 0.0f) t.hitFlashT -= dt;
+        // Victory ceasefire: the battle is over, turrets stand down so the
+        // post-battle tour isn't interrupted by impact flashes on the tank.
+        if (victory) continue;
         t.fireTimer += dt;
 
         // Pick target: nearest of player / alive allies in range with LOS.
@@ -1506,18 +1574,27 @@ static void ResolveWreckCollisions(Vector3 &pos, const std::vector<Enemy> &enemi
 static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
     static const Color CHARRED = { 38, 33, 28, 255 };
     for (const auto &e : enemies) {
-        if (e.alive && !e.visible) continue;  // fog of war
+        // Fog of war: fully fogged enemies are skipped; enemies in the
+        // soft reveal band fade in so they visibly emerge from the fog
+        // instead of popping into existence.
+        float alpha = e.alive ? (1.0f - e.fogFactor) : 1.0f;
+        if (alpha <= 0.02f) continue;
+        // A fading enemy must not write depth: it would punch a
+        // tank-shaped hole through the fog puffs behind it.
+        bool faded = alpha < 0.99f;
+        if (faded) rlDisableDepthMask();
         if (e.alive) {
             Color armor = cfg.enemyColor;
             if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
-            DrawTankHull(e.pos, e.hullAngle, armor);
+            DrawTankHull(e.pos, e.hullAngle, armor, alpha);
             DrawTankTurret(Vector3{ e.pos.x, 2.25f, e.pos.z },
-                           e.hullAngle + e.turretAngle, armor);
+                           e.hullAngle + e.turretAngle, armor, alpha);
             // Tracking ping: pulsing red ring under an enemy with a lock.
             if (e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) {
                 float pulse = 2.8f + sinf(e.aimTimer * 14.0f) * 0.5f;
-                DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z },
-                                  pulse, pulse, 0.12f, 24, Color{ 255, 40, 40, 230 });
+                DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z }, pulse, pulse,
+                                  0.12f, 24,
+                                  Color{ 255, 40, 40, (unsigned char)(230 * alpha) });
             }
         } else {
             // Burning wreck: charred hull, turret where it landed.
@@ -1529,8 +1606,90 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
             DrawSphere(Vector3{ e.pos.x + 0.5f, 1.5f, e.pos.z - 0.3f }, 0.35f * f,
                        Color{ 255, 190, 60, 190 });
         }
+        if (faded) rlEnableDepthMask();
     }
 }
+
+// Soft radial fog-puff sprite, generated once: white with a smooth falloff
+// so overlapping puffs melt into a continuous bank instead of hard discs.
+static Texture2D MakeFogPuffTexture() {
+    const int S = 128;
+    Image img = GenImageColor(S, S, Color{ 0, 0, 0, 0 });
+    Color *px = (Color *)img.data;
+    for (int y = 0; y < S; ++y) {
+        for (int x = 0; x < S; ++x) {
+            float dx = (x + 0.5f) / S * 2.0f - 1.0f;
+            float dy = (y + 0.5f) / S * 2.0f - 1.0f;
+            float d = sqrtf(dx * dx + dy * dy);
+            float a = fmaxf(0.0f, 1.0f - d);
+            a = a * a * (3.0f - 2.0f * a);
+            px[y * S + x] = Color{ 255, 255, 255, (unsigned char)(255.0f * a) };
+        }
+    }
+    Texture2D tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    return tex;
+}
+
+struct FogPuff {
+    Vector3 pos;
+    float size;
+    float alpha;
+    float dist2;  // to camera, for back-to-front sorting
+};
+
+// Visible fog of war: camera-facing soft puffs laid over fogged ground on
+// a coarse grid, back-to-front, depth-tested (buildings occlude puffs behind
+// them) but not depth-writing (puffs never carve holes in each other).
+// Unlike horizontal planes this reads from any camera height — the gunner
+// sees a fog wall on the horizon, the drone sees a soft blanket — and
+// enemies visibly drive out of it. Enemies mid-reveal also carry a small
+// wisp so the emergence reads up close.
+static void DrawFogPuffs(const Camera3D &camera, const std::vector<Enemy> &enemies,
+                         const std::vector<Vector3> &revealers,
+                         const std::vector<Building> &village,
+                         const Texture2D &puffTex, const Config &cfg) {
+    static std::vector<FogPuff> puffs;
+    puffs.clear();
+    puffs.reserve(1700);
+    const float step = 10.0f;
+    const float maxD2 = 300.0f * 300.0f;
+    for (float gz = -ARENA_HALF; gz <= ARENA_HALF; gz += step) {
+        for (float gx = -ARENA_HALF; gx <= ARENA_HALF; gx += step) {
+            float f = FogFactorAt(gx, gz, revealers, village,
+                                  cfg.fogSightRadius, cfg.fogEdgeWidth);
+            if (f < 0.04f) continue;
+            float dx = gx - camera.position.x, dz = gz - camera.position.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > maxD2) continue;
+            // Deterministic size variation so the bank edge looks organic
+            // instead of tiled (stable frame to frame — no shimmer).
+            float h = sinf(gx * 12.9898f + gz * 78.233f) * 43758.5453f;
+            float frac = h - floorf(h);
+            float size = cfg.fogPuffSize * (0.8f + 0.45f * frac);
+            puffs.push_back({ Vector3{ gx, 2.6f, gz }, size,
+                              f * cfg.fogPuffAlpha, d2 });
+        }
+    }
+    // Emergence wisps: enemies inside the reveal band drag fog with them.
+    for (const auto &e : enemies) {
+        if (!e.alive || e.fogFactor < 0.05f || e.fogFactor > 0.97f) continue;
+        float dx = e.pos.x - camera.position.x, dz = e.pos.z - camera.position.z;
+        puffs.push_back({ Vector3{ e.pos.x, 2.2f, e.pos.z },
+                          cfg.fogPuffSize * 0.45f, e.fogFactor * 0.5f,
+                          dx * dx + dz * dz });
+    }
+    std::sort(puffs.begin(), puffs.end(),
+              [](const FogPuff &a, const FogPuff &b) { return a.dist2 > b.dist2; });
+    rlDisableDepthMask();
+    for (const auto &p : puffs) {
+        unsigned char a = (unsigned char)(255.0f * fminf(1.0f, p.alpha));
+        if (a == 0) continue;
+        DrawBillboard(camera, puffTex, p.pos, p.size, Color{ 232, 234, 240, a });
+    }
+    rlEnableDepthMask();
+}
+
 
 // Allies: blue armor, selection ring for the ordered unit, objective marker.
 static void DrawAllies(const std::vector<Ally> &allies, const std::vector<Enemy> &enemies,
@@ -1574,6 +1733,145 @@ static void DrawAllies(const std::vector<Ally> &allies, const std::vector<Enemy>
             DrawSphere(Vector3{ a.pos.x, 1.7f, a.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
         }
     }
+}
+// Death-replay rendering: the world redrawn from a recorded snapshot,
+// from the drone's point of view. Fog of war is intentionally off — the
+// point of the replay is to see (and learn from) the full battlefield.
+static void DrawReplayBuildings(const std::vector<Building> &village,
+                                const std::vector<ReplayBldSnap> &rb) {
+    for (size_t i = 0; i < village.size() && i < rb.size(); ++i) {
+        const Building &b = village[i];
+        const ReplayBldSnap &r = rb[i];
+        if (r.destroyed) {
+            if (r.collapseT < 1.0f) {
+                float t = r.collapseT;
+                rlPushMatrix();
+                rlTranslatef(b.center.x, 0.0f, b.center.z);
+                rlRotatef(t * 68.0f, r.fallAxis.x, 0.0f, r.fallAxis.z);
+                rlTranslatef(0.0f, b.center.y - t * b.size.y * 0.75f, 0.0f);
+                DrawCube(Vector3{ 0, 0, 0 }, b.size.x, b.size.y, b.size.z,
+                         Color{ 90, 82, 74, 255 });
+                rlPopMatrix();
+            } else {
+                float rx = b.size.x * 0.5f, rz = b.size.z * 0.5f;
+                DrawCube(Vector3{ b.center.x - rx * 0.3f, 0.6f, b.center.z + rz * 0.2f },
+                         rx * 0.9f, 1.2f, rz * 0.8f, Color{ 95, 88, 80, 255 });
+                DrawCube(Vector3{ b.center.x + rx * 0.35f, 0.45f, b.center.z - rz * 0.25f },
+                         rx * 0.7f, 0.9f, rz * 0.7f, Color{ 100, 92, 84, 255 });
+                DrawCube(Vector3{ b.center.x + rx * 0.05f, 0.9f, b.center.z + rz * 0.05f },
+                         rx * 0.5f, 1.8f, rz * 0.5f, Color{ 90, 82, 74, 255 });
+            }
+            continue;
+        }
+        float f = 0.55f + 0.45f * ((float)r.hp / (float)b.maxHp);
+        Color c = Color{ (unsigned char)(b.color.r * f), (unsigned char)(b.color.g * f),
+                         (unsigned char)(b.color.b * f), 255 };
+        DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
+        DrawCubeWires(b.center, b.size.x, b.size.y, b.size.z, Color{ 0, 0, 0, 60 });
+        DrawCube(Vector3{ b.center.x, b.size.y + 0.05f, b.center.z },
+                 b.size.x * 0.98f, 0.1f, b.size.z * 0.98f,
+                 Color{ 70, 62, 55, 255 });
+    }
+}
+
+static void DrawReplayTowers(const std::vector<Tower> &towers,
+                             const std::vector<ReplayTowerSnap> &rt, float replayTime) {
+    for (size_t i = 0; i < towers.size() && i < rt.size(); ++i) {
+        const Tower &t = towers[i];
+        const ReplayTowerSnap &r = rt[i];
+        if (!r.alive) {
+            DrawCylinder(Vector3{ t.pos.x, 0.5f, t.pos.z }, 3.2f, 3.8f, 1.0f, 8,
+                         Color{ 60, 58, 55, 255 });
+            continue;
+        }
+        DrawCylinder(Vector3{ t.pos.x, 0.0f, t.pos.z }, 3.0f, 3.6f, 4.0f, 10,
+                     Color{ 130, 130, 135, 255 });
+        DrawCylinder(Vector3{ t.pos.x, 4.0f, t.pos.z }, 2.2f, 2.6f, 1.0f, 10,
+                     Color{ 70, 70, 78, 255 });
+        rlPushMatrix();
+        rlTranslatef(t.pos.x, 5.2f, t.pos.z);
+        rlRotatef(r.turretAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+        DrawCube(Vector3{ 0, 0, 0 }, 2.6f, 1.2f, 3.4f, Color{ 70, 70, 78, 255 });
+        DrawCube(Vector3{ 0, 0.1f, -2.8f }, 0.45f, 0.45f, 3.6f, Color{ 70, 70, 78, 255 });
+        rlPopMatrix();
+        // Warning light driven by replay time (the live frame counter is frozen).
+        if (((int)(replayTime * 2.0f) % 2) == 0)
+            DrawSphere(Vector3{ t.pos.x, 6.4f, t.pos.z }, 0.45f, RED);
+        for (int k = 0; k < t.maxHp; ++k)
+            DrawCube(Vector3{ t.pos.x - 2.0f + k * 1.2f, 7.2f, t.pos.z }, 0.9f, 0.9f, 0.9f,
+                     k < t.hp ? GREEN : DARKGRAY);
+    }
+}
+
+// Nearest recorded frame at or before time t (buffer times ascend).
+static const ReplayFrame *SampleReplay(const std::deque<ReplayFrame> &buf, float t) {
+    const ReplayFrame *best = nullptr;
+    for (auto it = buf.rbegin(); it != buf.rend(); ++it) {
+        best = &(*it);
+        if (it->time <= t) return best;
+    }
+    return best;
+}
+
+static void DrawReplay(const ReplayFrame &f,
+                       const std::vector<Building> &village,
+                       const std::vector<Tower> &towers,
+                       const std::vector<Ditch> &ditches,
+                       const std::vector<Bridge> &bridges,
+                       const Config &cfg, float replayTime) {
+    Camera3D rc = {};
+    rc.position = f.camPos;
+    rc.target = f.camTarget;
+    rc.up = Vector3{ 0.0f, 1.0f, 0.0f };
+    rc.fovy = 60.0f;
+    rc.projection = CAMERA_PERSPECTIVE;
+
+    BeginMode3D(rc);
+    DrawGround(ditches);
+    DrawGrid(40, 20.0f);
+    DrawBridges(bridges);
+    DrawReplayBuildings(village, f.buildings);
+    DrawReplayTowers(towers, f.towers, replayTime);
+    // Reconstruct temp tanks and reuse the regular draw paths.
+    Tank pt;
+    pt.pos = f.player.pos; pt.hullAngle = f.player.hullAngle;
+    pt.turretAngle = f.player.turretAngle;
+    DrawTank(pt, false);
+    std::vector<Ally> als;
+    als.reserve(f.allies.size());
+    for (const auto &ra : f.allies) {
+        Ally a;
+        a.pos = ra.pos; a.hullAngle = ra.hullAngle; a.turretAngle = ra.turretAngle;
+        a.alive = ra.alive; a.deathT = ra.deathT;
+        a.turretPos = ra.turretPos; a.turretSpin = ra.turretSpin;
+        als.push_back(a);
+    }
+    std::vector<Enemy> ens;
+    ens.reserve(f.enemies.size());
+    for (const auto &re : f.enemies) {
+        Enemy e;
+        e.pos = re.pos; e.hullAngle = re.hullAngle; e.turretAngle = re.turretAngle;
+        e.alive = re.alive; e.deathT = re.deathT;
+        e.turretPos = re.turretPos; e.turretSpin = re.turretSpin;
+        e.fogFactor = 0.0f;  // replays show the full battlefield
+        ens.push_back(e);
+    }
+    std::vector<Enemy> noEn;
+    DrawAllies(als, noEn, cfg, -1);
+    DrawEnemies(ens, cfg);
+    for (const auto &s : f.shells)
+        DrawSphere(s.pos, 0.35f, Color{ 255, 240, 180, 255 });
+    for (const auto &fl : f.flashes) {
+        float a = (fl.maxT > 0.0f) ? fl.t / fl.maxT : 0.0f;
+        DrawSphere(fl.pos, fl.size * (0.5f + 0.5f * a),
+                   Color{ 255, 180, 60, (unsigned char)(255 * a) });
+    }
+    for (const auto &p : f.particles) {
+        float a = (p.maxLife > 0.0f) ? fmaxf(p.life / p.maxLife, 0.0f) : 0.0f;
+        DrawSphere(p.pos, p.size * (0.4f + 0.6f * a),
+                   Color{ p.color.r, p.color.g, p.color.b, (unsigned char)(255 * a) });
+    }
+    EndMode3D();
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,10 +1932,14 @@ static void DrawMinimap(RenderTexture2D target, const Tank &tank,
     marker(tank.pos, tank.hullAngle, GREEN);
     for (const auto &a : allies)
         if (a.alive) marker(a.pos, a.hullAngle, cfg.allyColor);
-    // Enemies stay hidden during SETUP, and by fog of war.
+    // Enemies stay hidden during SETUP, and fade with fog of war.
     if (phase == Phase::COMBAT)
-        for (const auto &e : enemies)
-            if (e.alive && e.visible) marker(e.pos, e.hullAngle, cfg.enemyColor);
+        for (const auto &e : enemies) {
+            if (!e.alive || e.fogFactor >= 0.98f) continue;
+            Color c = cfg.enemyColor;
+            c.a = (unsigned char)(255 * (1.0f - e.fogFactor));
+            marker(e.pos, e.hullAngle, c);
+        }
     for (const auto &s : shells) DrawSphere(s.pos, 1.2f, YELLOW);
     EndMode3D();
     EndTextureMode();
@@ -1662,6 +1964,8 @@ static void DrawChaseView(RenderTexture2D target, const Tank &tank,
                           const std::vector<Shell> &shells,
                           const std::vector<Flash> &flashes,
                           const std::vector<Particle> &particles,
+                          const std::vector<Vector3> &revealers,
+                          const Texture2D &fogPuffTex,
                           const Config &cfg, Phase phase, int selectedAlly,
                           int screenWidth, int screenHeight, int frameCount) {
     int W = cfg.chaseWidth, H = cfg.chaseHeight;
@@ -1686,6 +1990,8 @@ static void DrawChaseView(RenderTexture2D target, const Tank &tank,
     DrawTank(tank, false);  // solid, never the gunner ghost
     if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
     DrawAllies(allies, enemies, cfg, selectedAlly);
+    if (phase == Phase::COMBAT && cfg.fogEnabled)
+        DrawFogPuffs(cc, enemies, revealers, village, fogPuffTex, cfg);
     for (const auto &s : shells) {
         if (s.trailCount >= 2)
             DrawCylinderEx(s.trail[0], s.pos, 0.22f, 0.22f, 8,
@@ -1724,6 +2030,9 @@ int main() {
     Config cfg = LoadConfig();
     RenderTexture2D minimapTarget = LoadRenderTexture(cfg.minimapSize, cfg.minimapSize);
     RenderTexture2D chaseTarget = LoadRenderTexture(cfg.chaseWidth, cfg.chaseHeight);
+    // Fog-of-war puffs: one soft radial sprite, instanced as camera-facing
+    // billboards over fogged ground.
+    Texture2D fogPuffTex = MakeFogPuffTexture();
 
     std::vector<GameMap> maps = BuildMaps(cfg.ditchDepth);
     int mapIdx = 0;
@@ -1754,6 +2063,14 @@ int main() {
     CamMode mode = CamMode::DRONE;
     Phase phase = Phase::SETUP;
     bool gameOver = false;
+    bool victory = false;           // arena cleared: free tour, can't lose
+    // Defeat replay: ring buffer of snapshots + playback state.
+    std::deque<ReplayFrame> replayBuf;
+    bool replayArmed = false;       // 1s beat after defeat, before replay
+    float replayWaitUntil = 0.0f;
+    bool replaying = false;
+    float replayPlayStart = 0.0f;   // GetTime() when playback started
+    float replayFrom = 0.0f, replayTo = 0.0f;
 
     // (Re)build everything for maps[mapIdx]: village, terrain, towers,
     // player, enemies, allies. Used at startup, on R, and on map change.
@@ -1784,6 +2101,9 @@ int main() {
         EnableCursor();
         phase = Phase::SETUP;
         gameOver = false;
+        victory = false;
+        replayBuf.clear();
+        replaying = false; replayArmed = false;
     };
     loadMap();
     Camera3D camera = {};
@@ -1803,10 +2123,23 @@ int main() {
         Vector3 mouseGround = { 0, 0, 0 };
         bool mouseGroundValid = false;
 
-        int aliveNow = 0;
-        for (const auto &e : enemies) if (e.alive) ++aliveNow;
-        if ((gameOver || aliveNow == 0) && IsKeyPressed(KEY_R)) {
-            // Restart: reload the current map, back to SETUP in drone mode.
+        if (replaying && IsKeyPressed(KEY_R)) {
+            // Skip the death replay, land on the defeat panel.
+            replaying = false;
+        } else if (replayArmed && IsKeyPressed(KEY_R)) {
+            // Skip the beat before the replay, land on the defeat panel.
+            replayArmed = false;
+        } else if (gameOver && !victory && IsKeyPressed(KEY_R)) {
+            // Defeat panel: watch the replay again (any number of times).
+            if (cfg.replayEnabled && replayBuf.size() >= 30) {
+                replaying = true;
+                replayPlayStart = (float)GetTime();
+            }
+        } else if (victory && IsKeyPressed(KEY_R)) {
+            // Victory panel: play again on the current map.
+            loadMap();
+        } else if (gameOver && !victory && IsKeyPressed(KEY_ENTER)) {
+            // Defeat panel: retry the battle.
             loadMap();
         }
 
@@ -1825,6 +2158,11 @@ int main() {
             battleStart = GetTime();
             battleEnd = 0.0;
         }
+
+        // Fog-of-war revealers (player, living allies, drone), refreshed in
+        // the update section below and reused by the fog-puff pass at draw.
+        // Declared here so game-over frames reuse the last live values.
+        std::vector<Vector3> revealers;
 
         if (!gameOver) {
 
@@ -1922,10 +2260,21 @@ int main() {
                         Vector3 hc = { tank.pos.x, 1.6f, tank.pos.z };
                         flashes.push_back(Flash{ hc, 0.4f, 0.4f, 2.5f });
                         Burst(particles, hc, 8, Color{ 255, 150, 40, 255 }, 7.0f, 6.0f, 0.7f, 0.6f, 6.0f);
-                        if (tank.hp <= 0) {
+                        if (tank.hp <= 0 && !victory) {
                             gameOver = true;
                             battleEnd = GetTime();
+                            // Arm the death replay if we have enough footage.
+                            if (cfg.replayEnabled && replayBuf.size() >= 30) {
+                                replayTo = replayBuf.back().time;
+                                replayFrom = fmaxf(replayBuf.front().time,
+                                                   replayTo - cfg.replayDuration);
+                                replayArmed = true;
+                                replayWaitUntil = (float)GetTime() + 1.0f;
+                            }
+                            replaying = false;
                         }
+                        // Post-victory tour: hits still flash, but the tank can't die.
+                        if (victory && tank.hp < 1) tank.hp = 1;
                         dead = true;
                     }
                     if (!dead) {
@@ -1974,7 +2323,7 @@ int main() {
         if (phase == Phase::COMBAT) {
             for (auto &e : enemies)
                 UpdateEnemyAI(e, tank, village, ditches, bridges, shells, flashes, cfg, dt);
-            UpdateTowers(towers, tank, allies, village, shells, flashes, cfg, dt);
+            UpdateTowers(towers, tank, allies, village, shells, flashes, cfg, dt, victory);
         }
         UpdateEnemies(enemies, particles, dt);
         // Ally AI (orders + engage) + death animations. In SETUP allies
@@ -1989,18 +2338,70 @@ int main() {
         ResolveTowerCollisions(tank.pos, towers);
         for (auto &e : enemies) ResolveTowerCollisions(e.pos, towers);
         for (auto &a : allies) ResolveTowerCollisions(a.pos, towers);
-        // Fog of war: enemy visibility from revealers (player, allies, drone).
+        // Fog of war: per-enemy fog factor from revealers (player, allies,
+        // drone). The revealer list is reused below by the visible fog puffs.
+        revealers.clear();
         if (phase == Phase::COMBAT && cfg.fogEnabled) {
-            std::vector<Vector3> revealers;
             revealers.push_back(tank.pos);
             for (const auto &a : allies) if (a.alive) revealers.push_back(a.pos);
             revealers.push_back(drone.pos);
-            for (auto &e : enemies) {
-                e.visible = e.alive && VisibleToRevealers(e.pos.x, e.pos.z, revealers,
-                                                          village, cfg.fogSightRadius);
+            for (auto &e : enemies)
+                e.fogFactor = e.alive ? FogFactorAt(e.pos.x, e.pos.z, revealers, village,
+                                                    cfg.fogSightRadius, cfg.fogEdgeWidth)
+                                      : 0.0f;
+        } else {
+            for (auto &e : enemies) e.fogFactor = 0.0f;
+        }
+        // Victory: the last enemy is destroyed. The battle is over — the map
+        // stays navigable for a post-battle tour, but the player can no
+        // longer lose (HP clamps at 1, see the shell-hit code).
+        if (!victory && phase == Phase::COMBAT) {
+            bool anyAlive = false;
+            for (const auto &e : enemies) if (e.alive) { anyAlive = true; break; }
+            if (!anyAlive) {
+                victory = true;
+                if (battleEnd == 0.0) battleEnd = GetTime();
             }
-        } else if (!cfg.fogEnabled) {
-            for (auto &e : enemies) e.visible = e.alive;
+        }
+        // Death-replay recorder: 20 Hz snapshots of the battlefield state.
+        if (cfg.replayEnabled && phase == Phase::COMBAT && !gameOver && (frameCount % 3 == 0)) {
+            ReplayFrame fr;
+            fr.time = (float)GetTime();
+            fr.player = { tank.pos, tank.hullAngle, tank.turretAngle, tank.hp > 0,
+                          0.0f, Vector3{ 0, 0, 0 }, 0.0f };
+            for (const auto &a : allies)
+                fr.allies.push_back({ a.pos, a.hullAngle, a.turretAngle, a.alive,
+                                      a.deathT, a.turretPos, a.turretSpin });
+            for (const auto &e : enemies)
+                fr.enemies.push_back({ e.pos, e.hullAngle, e.turretAngle, e.alive,
+                                      e.deathT, e.turretPos, e.turretSpin });
+            for (const auto &s : shells) {
+                if (fr.shells.size() >= 40) break;
+                fr.shells.push_back({ s.pos });
+            }
+            for (const auto &fl : flashes) {
+                if (fr.flashes.size() >= 20) break;
+                fr.flashes.push_back({ fl.pos, fl.t, fl.maxT, fl.size });
+            }
+            for (const auto &p : particles) {
+                if (fr.particles.size() >= 120) break;
+                fr.particles.push_back({ p.pos, p.color, p.size, p.life, p.maxLife });
+            }
+            for (const auto &b : village)
+                fr.buildings.push_back({ b.destroyed, b.collapseT, b.hp, b.fallAxis });
+            for (const auto &t : towers)
+                fr.towers.push_back({ t.alive, t.turretAngle });
+            // Replay camera: a follow-drone behind the player (same framing
+            // as the chase view), so the tank and its destruction stay in
+            // frame even if the real drone was parked elsewhere.
+            Vector3 behind = { -sinf(tank.hullAngle), 0.0f, cosf(tank.hullAngle) };
+            fr.camPos = Vector3{ tank.pos.x + behind.x * cfg.chaseCamDist,
+                                 tank.pos.y + cfg.chaseCamHeight,
+                                 tank.pos.z + behind.z * cfg.chaseCamDist };
+            fr.camTarget = Vector3{ tank.pos.x, tank.pos.y + 2.0f, tank.pos.z };
+            replayBuf.push_back(std::move(fr));
+            size_t maxFrames = (size_t)(cfg.replayDuration * 20.0f * 1.5f);
+            while (replayBuf.size() > maxFrames) replayBuf.pop_front();
         }
         // Wrecks block enemies too; enemies keep separation from each other.
         for (auto &e : enemies) {
@@ -2125,8 +2526,38 @@ int main() {
         }
         }  // end if (!gameOver)
 
+        // Defeat replay timing runs on the wall clock (the sim is frozen).
+        if (replayArmed && GetTime() >= replayWaitUntil) {
+            replayArmed = false;
+            replaying = true;
+            replayPlayStart = (float)GetTime();
+        }
+        bool inReplay = false;
+        float replayNow = 0.0f;
+        if (replaying) {
+            replayNow = replayFrom + (float)(GetTime() - replayPlayStart);
+            if (replayNow >= replayTo || replayBuf.empty()) replaying = false;
+            else inReplay = true;
+        }
+
         BeginDrawing();
         ClearBackground(SKYBLUE);
+
+        if (inReplay) {
+            const ReplayFrame *fr = SampleReplay(replayBuf, replayNow);
+            if (fr) DrawReplay(*fr, village, towers, ditches, bridges, cfg,
+                               replayNow - replayFrom);
+            // Replay chrome: label, progress bar, skip hint.
+            DrawRectangle(0, 0, screenWidth, 36, Color{ 0, 0, 0, 160 });
+            DrawText(TextFormat("REPLAY - last %ds (full visibility)", (int)cfg.replayDuration),
+                     12, 8, 20, YELLOW);
+            DrawText("R to skip", screenWidth - 110, 8, 20, LIGHTGRAY);
+            float prog = (replayTo > replayFrom)
+                ? Clamp((replayNow - replayFrom) / (replayTo - replayFrom), 0.0f, 1.0f) : 0.0f;
+            DrawRectangle(12, 32, (int)((screenWidth - 24) * prog), 4, YELLOW);
+            EndDrawing();
+            continue;
+        }
 
         BeginMode3D(camera);
         // Ground with ditch pits, street grid, bridges, towers.
@@ -2139,6 +2570,9 @@ int main() {
         // Enemies are hidden until combat begins, and by fog of war.
         if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
         DrawAllies(allies, enemies, cfg, selectedAlly);
+        // Fog puffs over the opaque world (enemies emerge from them).
+        if (phase == Phase::COMBAT && cfg.fogEnabled)
+            DrawFogPuffs(camera, enemies, revealers, village, fogPuffTex, cfg);
         // Drone-mode mouse cursor: ring + crosshair on the ground.
         if (mode == CamMode::DRONE && mouseGroundValid) {
             DrawCylinderWires(Vector3{ mouseGround.x, 0.08f, mouseGround.z },
@@ -2192,8 +2626,8 @@ int main() {
         // Chase drone view above the minimap: follow-cam on the player tank.
         if (mode == CamMode::GUNNER && cfg.chaseEnabled)
             DrawChaseView(chaseTarget, tank, allies, enemies, village, ditches, bridges,
-                          towers, shells, flashes, particles, cfg, phase, selectedAlly,
-                          screenWidth, screenHeight, frameCount);
+                          towers, shells, flashes, particles, revealers, fogPuffTex,
+                          cfg, phase, selectedAlly, screenWidth, screenHeight, frameCount);
 
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
@@ -2365,20 +2799,7 @@ int main() {
             DrawText(TextFormat("Shots  %d   Accuracy  %.0f%%", shotsFired, acc),
                      tx, ty + lh * 3, 20, c);
         };
-        if (gameOver) {
-            int pw = 360, ph = 230;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
-            DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
-            DrawRectangle(px, py, pw, ph, Color{ 20, 8, 8, 235 });
-            DrawRectangleLines(px, py, pw, ph, RED);
-            int tx = px + 30, ty = py + 24;
-            DrawText("DEFEAT", tx, ty, 40, RED);
-            DrawText("Your tank was destroyed.", tx, ty + 52, 20, LIGHTGRAY);
-            battleStats(tx, ty + 92, 30, WHITE);
-            if ((frameCount / 30) % 2 == 0)
-                DrawText("Press R to retry", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
-        } else if (aliveCount == 0 && phase == Phase::COMBAT) {
-            if (battleEnd == 0.0) battleEnd = GetTime();
+        if (victory) {
             int pw = 360, ph = 230;
             int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
             DrawRectangle(px, py, pw, ph, Color{ 8, 20, 12, 235 });
@@ -2387,8 +2808,29 @@ int main() {
             DrawText("VICTORY", tx, ty, 40, GREEN);
             DrawText("Arena cleared!", tx, ty + 52, 20, LIGHTGRAY);
             battleStats(tx, ty + 92, 30, WHITE);
-            if ((frameCount / 30) % 2 == 0)
+            if (((int)(GetTime() * 2.0) % 2) == 0)
                 DrawText("Press R to play again", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
+        } else if (gameOver && !replaying && !replayArmed) {
+            // Integrated defeat panel: battle stats plus the replay, which
+            // can be rewatched any number of times.
+            int pw = 380, ph = 300;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
+            DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
+            DrawRectangle(px, py, pw, ph, Color{ 20, 8, 8, 235 });
+            DrawRectangleLines(px, py, pw, ph, RED);
+            int tx = px + 30, ty = py + 24;
+            DrawText("DEFEAT", tx, ty, 40, RED);
+            DrawText("Your tank was destroyed.", tx, ty + 52, 20, LIGHTGRAY);
+            battleStats(tx, ty + 88, 28, WHITE);
+            bool canReplay = cfg.replayEnabled && replayBuf.size() >= 30;
+            if (((int)(GetTime() * 2.0) % 2) == 0) {
+                int hy = ty + 88 + 28 * 4 + 8;
+                if (canReplay) {
+                    DrawText("R - watch replay", tx, hy, 22, GREEN);
+                    hy += 30;
+                }
+                DrawText("ENTER - retry", tx, hy, 22, YELLOW);
+            }
         }
         if (mode == CamMode::GUNNER) {
             // Crosshair

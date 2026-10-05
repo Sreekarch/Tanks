@@ -165,8 +165,13 @@ static Config LoadConfig() {
         c.towerAimTime = tw.value("aimTime", c.towerAimTime);
         auto mp = j.value("map", nlohmann::json::object());
         std::string md = mp.value("default", std::string(c.mapDefault));
-        // Portable copy (strncpy_s is MSVC-only); always null-terminate.
+        // MSVC wants strncpy_s; everywhere else uses strncpy. Either way,
+        // always null-terminate.
+#ifdef _MSC_VER
         strncpy_s(c.mapDefault, md.c_str(), sizeof(c.mapDefault) - 1);
+#else
+        strncpy(c.mapDefault, md.c_str(), sizeof(c.mapDefault) - 1);
+#endif
         c.mapDefault[sizeof(c.mapDefault) - 1] = '\0';
     } catch (...) { /* keep defaults */ }
     return c;
@@ -2071,6 +2076,10 @@ int main() {
     bool replaying = false;
     float replayPlayStart = 0.0f;   // GetTime() when playback started
     float replayFrom = 0.0f, replayTo = 0.0f;
+    // Victory replay: span covering the battle's end, frozen the moment
+    // victory hits (the buffer keeps recording the post-victory tour).
+    float vreplayFrom = 0.0f, vreplayTo = 0.0f;
+    bool vreplayAvail = false;
 
     // (Re)build everything for maps[mapIdx]: village, terrain, towers,
     // player, enemies, allies. Used at startup, on R, and on map change.
@@ -2136,7 +2145,15 @@ int main() {
                 replayPlayStart = (float)GetTime();
             }
         } else if (victory && IsKeyPressed(KEY_R)) {
-            // Victory panel: play again on the current map.
+            // Victory panel: watch the end-of-battle replay.
+            if (vreplayAvail) {
+                replayFrom = vreplayFrom;
+                replayTo = vreplayTo;
+                replaying = true;
+                replayPlayStart = GetTime();
+            }
+        } else if (victory && IsKeyPressed(KEY_ENTER)) {
+            // Victory panel: start a new mission on the current map.
             loadMap();
         } else if (gameOver && !victory && IsKeyPressed(KEY_ENTER)) {
             // Defeat panel: retry the battle.
@@ -2361,6 +2378,13 @@ int main() {
             if (!anyAlive) {
                 victory = true;
                 if (battleEnd == 0.0) battleEnd = GetTime();
+                // Freeze the victory-replay span now: the buffer keeps
+                // recording the post-victory tour, so pin the battle's end.
+                if (cfg.replayEnabled && replayBuf.size() >= 30) {
+                    vreplayTo = replayBuf.back().time;
+                    vreplayFrom = fmaxf(replayBuf.front().time, vreplayTo - cfg.replayDuration);
+                    vreplayAvail = true;
+                }
             }
         }
         // Death-replay recorder: 20 Hz snapshots of the battlefield state.
@@ -2799,17 +2823,25 @@ int main() {
             DrawText(TextFormat("Shots  %d   Accuracy  %.0f%%", shotsFired, acc),
                      tx, ty + lh * 3, 20, c);
         };
-        if (victory) {
-            int pw = 360, ph = 230;
+        if (victory && !replaying) {
+            // Victory panel mirrors the defeat panel: stats plus a rewatchable
+            // replay of the battle's end. The tour continues behind it.
+            int pw = 380, ph = 300;
             int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
             DrawRectangle(px, py, pw, ph, Color{ 8, 20, 12, 235 });
             DrawRectangleLines(px, py, pw, ph, GREEN);
             int tx = px + 30, ty = py + 24;
             DrawText("VICTORY", tx, ty, 40, GREEN);
-            DrawText("Arena cleared!", tx, ty + 52, 20, LIGHTGRAY);
-            battleStats(tx, ty + 92, 30, WHITE);
-            if (((int)(GetTime() * 2.0) % 2) == 0)
-                DrawText("Press R to play again", tx, ty + 92 + 30 * 4 + 10, 22, GREEN);
+            DrawText("Arena cleared! (free tour)", tx, ty + 52, 20, LIGHTGRAY);
+            battleStats(tx, ty + 88, 28, WHITE);
+            if (((int)(GetTime() * 2.0) % 2) == 0) {
+                int hy = ty + 88 + 28 * 4 + 8;
+                if (vreplayAvail) {
+                    DrawText("R - watch replay", tx, hy, 22, GREEN);
+                    hy += 30;
+                }
+                DrawText("ENTER - new mission", tx, hy, 22, YELLOW);
+            }
         } else if (gameOver && !replaying && !replayArmed) {
             // Integrated defeat panel: battle stats plus the replay, which
             // can be rewatched any number of times.

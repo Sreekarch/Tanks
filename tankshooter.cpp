@@ -66,6 +66,7 @@ struct Config {
     float fogPuffSize      = 22.0f;  // world-unit diameter of one fog puff
     bool  replayEnabled    = true;   // defeat replays the last seconds
     float replayDuration   = 10.0f;  // seconds of replay footage
+    float replayPostSeconds = 4.0f;  // aftermath included in the victory replay
     // Ditches (tanks get stuck/slowed) and bridges
     float ditchSlowFactor  = 0.15f;  // speed multiplier inside a ditch
     float ditchDepth       = 3.0f;
@@ -155,6 +156,7 @@ static Config LoadConfig() {
         auto rp = j.value("replay", nlohmann::json::object());
         c.replayEnabled  = rp.value("enabled", c.replayEnabled);
         c.replayDuration = rp.value("durationSeconds", c.replayDuration);
+        c.replayPostSeconds = rp.value("postVictorySeconds", c.replayPostSeconds);
         auto dt2 = j.value("ditch", nlohmann::json::object());
         c.ditchSlowFactor = dt2.value("slowFactor", c.ditchSlowFactor);
         c.ditchDepth      = dt2.value("depth", c.ditchDepth);
@@ -795,6 +797,10 @@ struct OrderPing {
     Color color;
 };
 
+// Mechanical alien invader variants. Enemies are walkers now (red tanks
+// are retired); the AI underneath is unchanged.
+enum class WalkerKind { TRIPOD, CRAB, BIPED };
+
 // Death replay: ring buffer of world snapshots (20 Hz, ~15 s) so the
 // defeat screen can replay the last seconds from the drone's point of view.
 // Only the visual state is recorded — positions, damage, death anims.
@@ -805,6 +811,7 @@ struct ReplayTankSnap {
 struct ReplayEnemySnap {
     Vector3 pos; float hullAngle, turretAngle; bool alive;
     float deathT; Vector3 turretPos; float turretSpin;
+    WalkerKind kind; float walkPhase; Vector3 fallAxis;
 };
 struct ReplayShellSnap { Vector3 pos; };
 struct ReplayFlashSnap { Vector3 pos; float t, maxT, size; };
@@ -852,6 +859,9 @@ struct Enemy {
     int hp = 2;
     int maxHp = 2;
     bool alive = true;
+    WalkerKind kind = WalkerKind::TRIPOD;  // mechanical alien variant
+    float walkPhase = 0.0f;   // leg animation phase, advanced by movement
+    Vector3 fallAxis = { 1.0f, 0.0f, 0.0f };  // wreck collapse axis
     float fogFactor = 0.0f;   // fog of war: 0 = revealed, 1 = fully fogged
     float hitFlashT = 0.0f;   // white hit feedback timer
     // AI state.
@@ -1036,6 +1046,8 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
             ? cfg.ditchSlowFactor : 1.0f;
         e.pos.x += sinf(e.hullAngle) * speed * throttle * dt * dm;
         e.pos.z += -cosf(e.hullAngle) * speed * throttle * dt * dm;
+        // Walkers animate their legs proportional to distance covered.
+        e.walkPhase += speed * throttle * dt * dm * 1.1f;
     };
 
     switch (e.aiState) {
@@ -1064,7 +1076,11 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
                 float spread = ((float)GetRandomValue(-100, 100) / 100.0f) * cfg.enemySpread;
                 float fa = e.hullAngle + e.turretAngle + spread;
                 Vector3 fwd = { sinf(fa), 0.0f, -cosf(fa) };
-                Vector3 muzzle = { e.pos.x + fwd.x * 3.55f, 2.25f, e.pos.z + fwd.z * 3.55f };
+                // Walkers fire from the ventral gun pod (low, in the hit band);
+                // tanks fire from the turret.
+                float muzzleY = (e.kind == WalkerKind::TRIPOD) ? 2.5f : 2.25f;
+                float muzzleD = (e.kind == WalkerKind::TRIPOD) ? 3.4f : 3.55f;
+                Vector3 muzzle = { e.pos.x + fwd.x * muzzleD, muzzleY, e.pos.z + fwd.z * muzzleD };
                 Shell s;
                 s.pos = muzzle;
                 s.vel = Vector3Scale(fwd, cfg.shellSpeed);
@@ -1155,6 +1171,7 @@ static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Bu
         if (bad) continue;
         Enemy e;
         e.pos = { x, 0.0f, z };
+        e.kind = WalkerKind::TRIPOD;
         e.hullAngle = (float)GetRandomValue(0, 360) * DEG2RAD;
         e.turretAngle = (float)GetRandomValue(-60, 60) * DEG2RAD;
         e.hp = e.maxHp = hits;
@@ -1397,15 +1414,20 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
         e.aimTimer = 0.0f;
         return;
     }
-    // Kill: fireball flash, flame + smoke burst, turret pops off.
+    // Kill: fireball flash, flame + smoke burst, head/turret pops off.
     e.alive = false;
     e.deathT = 0.0f;
-    Vector3 c = { e.pos.x, 1.6f, e.pos.z };
+    float burstY = (e.kind == WalkerKind::TRIPOD) ? 2.8f : 1.6f;
+    Vector3 c = { e.pos.x, burstY, e.pos.z };
     flashes.push_back(Flash{ c, 0.55f, 0.55f, 3.8f });
     Burst(particles, c, 10, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 0.9f, 0.7f, 6.0f);   // flames
     Burst(particles, c, 12, Color{ 90, 85, 80, 255 }, 4.0f, 9.0f, 1.4f, 2.6f, -3.0f);    // smoke
     Burst(particles, c, 6, Color{ 255, 220, 120, 255 }, 14.0f, 5.0f, 0.5f, 0.4f, 10.0f);  // sparks
-    e.turretPos = { e.pos.x, 2.25f, e.pos.z };
+    float headY = (e.kind == WalkerKind::TRIPOD) ? 4.5f : 2.25f;
+    e.turretPos = { e.pos.x, headY, e.pos.z };
+    // Walkers keel over around a random horizontal axis as they die.
+    float fa = (float)GetRandomValue(0, 360) * DEG2RAD;
+    e.fallAxis = { cosf(fa), 0.0f, sinf(fa) };
     // Strong outward pop: guaranteed to clear the hull (half-diagonal ~2.8
     // + turret radius 1.35) so the barrel doesn't end up inside the wreck.
     float popA = (float)GetRandomValue(0, 360) * DEG2RAD;
@@ -1576,6 +1598,132 @@ static void ResolveWreckCollisions(Vector3 &pos, const std::vector<Enemy> &enemi
     }
 }
 
+static Color WithAlpha(Color c, float a) {
+    c.a = (unsigned char)(255.0f * Clamp(a, 0.0f, 1.0f));
+    return c;
+}
+
+// Tapered limb segment between two points (walker legs, antennae, gun pods).
+static void DrawLimb(const Vector3 &a, const Vector3 &b, float r, Color c) {
+    DrawCylinderEx(a, b, r, r * 0.7f, 8, c);
+}
+
+// Tripod walker chassis + legs in a local frame: origin on the ground under
+// the walker, -Z forward, already yawed by the hull angle. crumple 0 = intact,
+// 1 = collapsed wreck (legs fold, chassis drops).
+static void DrawTripodLocal(float walkPhase, float bobY, Color body, Color metal,
+                            Color dark, Color trim, float alpha, float crumple) {
+    float chassisY = 3.0f + bobY - crumple * 1.7f;
+    // Central armored pod (scaled sphere).
+    rlPushMatrix();
+    rlTranslatef(0.0f, chassisY, 0.0f);
+    rlScalef(1.5f, 0.95f, 1.5f);
+    DrawSphere(Vector3{ 0.0f, 0.0f, 0.0f }, 1.5f, WithAlpha(body, alpha));
+    rlPopMatrix();
+    // Armor trim ring around the pod's equator.
+    DrawCylinder(Vector3{ 0.0f, chassisY - 0.15f, 0.0f }, 2.1f, 2.25f, 0.35f, 12,
+                 WithAlpha(trim, alpha));
+    // Twin sensor antennae with glowing tips.
+    for (float sx : { -0.55f, 0.55f }) {
+        Vector3 ab = { sx, chassisY + 1.1f, 0.35f };
+        Vector3 at = { sx * 1.5f, chassisY + 2.1f, 0.5f };
+        DrawLimb(ab, at, 0.06f, WithAlpha(dark, alpha));
+        DrawSphere(at, 0.13f, WithAlpha(trim, alpha));
+    }
+    // Three legs, 120 degrees apart, procedural walk cycle.
+    for (int i = 0; i < 3; ++i) {
+        float a = (float)i * (2.0f * PI / 3.0f);
+        Vector3 outward = { sinf(a), 0.0f, -cosf(a) };
+        Vector3 hip = { outward.x * 1.1f, chassisY - 0.3f, outward.z * 1.1f };
+        float ph = walkPhase + (float)i * (2.0f * PI / 3.0f);
+        float stepping = (crumple > 0.5f) ? 0.0f : 1.0f;
+        float stride = sinf(ph) * 1.0f * stepping;
+        float lift = fmaxf(0.0f, sinf(ph + PI * 0.5f)) * 0.8f * stepping;
+        float spread = 2.9f - crumple * 1.3f;
+        Vector3 foot = { outward.x * spread, lift - crumple * 0.3f,
+                         outward.z * spread - stride };
+        Vector3 knee = { (hip.x + foot.x) * 0.5f + outward.x * 0.9f,
+                         (hip.y + foot.y) * 0.5f + 1.0f - crumple * 1.4f,
+                         (hip.z + foot.z) * 0.5f + outward.z * 0.9f };
+        DrawLimb(hip, knee, 0.28f, WithAlpha(metal, alpha));
+        DrawLimb(knee, foot, 0.2f, WithAlpha(dark, alpha));
+        // Hip and knee joint pods in trim color.
+        DrawSphere(hip, 0.34f, WithAlpha(trim, alpha));
+        DrawSphere(knee, 0.26f, WithAlpha(metal, alpha));
+        DrawSphere(foot, 0.32f, WithAlpha(dark, alpha));
+    }
+}
+
+// Sensor head + ventral gun pod, yawed by the walker's aim (hull + turret).
+// World space; the head is the part that pops off on death.
+static void DrawTripodHead(const Enemy &e, Color armor, Color trim, Color glow, float alpha) {
+    float headA = e.hullAngle + e.turretAngle;
+    Vector3 hd = { sinf(headA), 0.0f, -cosf(headA) };
+    float bobY = sinf(e.walkPhase * 2.0f) * 0.08f;
+    // Neck from the pod top to the head.
+    Vector3 neckB = { e.pos.x + hd.x * 0.7f, 4.1f + bobY, e.pos.z + hd.z * 0.7f };
+    Vector3 hc = { e.pos.x + hd.x * 1.5f, 4.6f + bobY, e.pos.z + hd.z * 1.5f };
+    DrawLimb(neckB, hc, 0.3f, WithAlpha(armor, alpha));
+    DrawSphere(hc, 0.8f, WithAlpha(armor, alpha));
+    // Glowing sensor eye on the head's face.
+    Vector3 eyeP = { hc.x + hd.x * 0.68f, hc.y + 0.15f, hc.z + hd.z * 0.68f };
+    DrawSphere(eyeP, 0.3f, WithAlpha(glow, alpha));
+    DrawSphere(eyeP, 0.16f, WithAlpha(Color{ 255, 255, 255, 255 }, alpha));
+    // Ventral gun pod slung under the chassis, barrel forward.
+    Vector3 gunC = { e.pos.x + hd.x * 0.9f, 2.5f + bobY, e.pos.z + hd.z * 0.9f };
+    DrawSphere(gunC, 0.5f, WithAlpha(trim, alpha));
+    Vector3 m1 = { gunC.x + hd.x * 2.5f, gunC.y, gunC.z + hd.z * 2.5f };
+    DrawLimb(gunC, m1, 0.16f, WithAlpha(Color{ 30, 32, 38, 255 }, alpha));
+    DrawSphere(m1, 0.2f, WithAlpha(glow, alpha));  // muzzle glow
+}
+
+// Living tripod walker.
+static void DrawTripodWalker(const Enemy &e, const Config &cfg, float alpha) {
+    static const Color GUNMETAL = { 52, 55, 62, 255 };
+    static const Color LEGMETAL = { 70, 74, 82, 255 };
+    static const Color DARKMETAL = { 30, 32, 38, 255 };
+    Color trim = cfg.enemyColor;
+    Color glow = Color{ (unsigned char)fminf(trim.r * 1.6f, 255.0f),
+                       (unsigned char)fminf(trim.g * 1.6f, 255.0f),
+                       (unsigned char)fminf(trim.b * 1.6f, 255.0f), 255 };
+    if (e.hitFlashT > 0.0f) {
+        trim = Color{ 255, 240, 230, 255 };
+        glow = Color{ 255, 255, 255, 255 };
+    }
+    float bobY = sinf(e.walkPhase * 2.0f) * 0.08f;
+    rlPushMatrix();
+    rlTranslatef(e.pos.x, 0.0f, e.pos.z);
+    rlRotatef(-e.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    DrawTripodLocal(e.walkPhase, bobY, GUNMETAL, LEGMETAL, DARKMETAL, trim, alpha, 0.0f);
+    rlPopMatrix();
+    DrawTripodHead(e, GUNMETAL, trim, glow, alpha);
+}
+
+// Dead tripod: chassis keeled over around its fall axis, legs crumpled,
+// sensor head popped off ballistically (drawn where it landed).
+static void DrawTripodWreck(const Enemy &e) {
+    static const Color CHARRED = { 38, 33, 28, 255 };
+    static const Color CHARRED2 = { 52, 48, 44, 255 };
+    float tip = fminf(e.deathT * 2.2f, 1.05f);
+    float sink = fminf(e.deathT * 0.8f, 0.8f);
+    rlPushMatrix();
+    rlTranslatef(e.pos.x, 0.0f, e.pos.z);
+    rlRotatef(tip * RAD2DEG, e.fallAxis.x, 0.0f, e.fallAxis.z);
+    rlTranslatef(0.0f, -sink, 0.0f);
+    rlRotatef(-e.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    DrawTripodLocal(e.walkPhase, 0.0f, CHARRED, CHARRED2, CHARRED, CHARRED2, 1.0f, 1.0f);
+    rlPopMatrix();
+    // The popped head where it landed.
+    DrawSphere(e.turretPos, 0.8f, CHARRED);
+    DrawSphere(Vector3{ e.turretPos.x, e.turretPos.y + 0.15f, e.turretPos.z },
+               0.3f, CHARRED2);
+    // Fire flicker on the collapsed chassis.
+    float f = 0.75f + 0.25f * sinf(e.deathT * 13.0f);
+    DrawSphere(Vector3{ e.pos.x, 2.2f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
+    DrawSphere(Vector3{ e.pos.x + 0.5f, 2.0f, e.pos.z - 0.3f }, 0.35f * f,
+               Color{ 255, 190, 60, 190 });
+}
+
 static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
     static const Color CHARRED = { 38, 33, 28, 255 };
     for (const auto &e : enemies) {
@@ -1589,27 +1737,36 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
         bool faded = alpha < 0.99f;
         if (faded) rlDisableDepthMask();
         if (e.alive) {
-            Color armor = cfg.enemyColor;
-            if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
-            DrawTankHull(e.pos, e.hullAngle, armor, alpha);
-            DrawTankTurret(Vector3{ e.pos.x, 2.25f, e.pos.z },
-                           e.hullAngle + e.turretAngle, armor, alpha);
+            if (e.kind == WalkerKind::TRIPOD) {
+                DrawTripodWalker(e, cfg, alpha);
+            } else {
+                Color armor = cfg.enemyColor;
+                if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
+                DrawTankHull(e.pos, e.hullAngle, armor, alpha);
+                DrawTankTurret(Vector3{ e.pos.x, 2.25f, e.pos.z },
+                               e.hullAngle + e.turretAngle, armor, alpha);
+            }
             // Tracking ping: pulsing red ring under an enemy with a lock.
             if (e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) {
-                float pulse = 2.8f + sinf(e.aimTimer * 14.0f) * 0.5f;
+                float base = (e.kind == WalkerKind::TRIPOD) ? 3.6f : 2.8f;
+                float pulse = base + sinf(e.aimTimer * 14.0f) * 0.5f;
                 DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z }, pulse, pulse,
                                   0.12f, 24,
                                   Color{ 255, 40, 40, (unsigned char)(230 * alpha) });
             }
         } else {
-            // Burning wreck: charred hull, turret where it landed.
-            DrawTankHull(e.pos, e.hullAngle, CHARRED);
-            DrawTankTurret(e.turretPos, e.turretSpin, CHARRED);
-            // Fire flicker on the hull.
-            float f = 0.75f + 0.25f * sinf(e.deathT * 13.0f);
-            DrawSphere(Vector3{ e.pos.x, 1.7f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
-            DrawSphere(Vector3{ e.pos.x + 0.5f, 1.5f, e.pos.z - 0.3f }, 0.35f * f,
-                       Color{ 255, 190, 60, 190 });
+            if (e.kind == WalkerKind::TRIPOD) {
+                DrawTripodWreck(e);
+            } else {
+                // Burning wreck: charred hull, turret where it landed.
+                DrawTankHull(e.pos, e.hullAngle, CHARRED);
+                DrawTankTurret(e.turretPos, e.turretSpin, CHARRED);
+                // Fire flicker on the hull.
+                float f = 0.75f + 0.25f * sinf(e.deathT * 13.0f);
+                DrawSphere(Vector3{ e.pos.x, 1.7f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
+                DrawSphere(Vector3{ e.pos.x + 0.5f, 1.5f, e.pos.z - 0.3f }, 0.35f * f,
+                           Color{ 255, 190, 60, 190 });
+            }
         }
         if (faded) rlEnableDepthMask();
     }
@@ -1858,6 +2015,7 @@ static void DrawReplay(const ReplayFrame &f,
         e.pos = re.pos; e.hullAngle = re.hullAngle; e.turretAngle = re.turretAngle;
         e.alive = re.alive; e.deathT = re.deathT;
         e.turretPos = re.turretPos; e.turretSpin = re.turretSpin;
+        e.kind = re.kind; e.walkPhase = re.walkPhase; e.fallAxis = re.fallAxis;
         e.fogFactor = 0.0f;  // replays show the full battlefield
         ens.push_back(e);
     }
@@ -2076,9 +2234,10 @@ int main() {
     bool replaying = false;
     float replayPlayStart = 0.0f;   // GetTime() when playback started
     float replayFrom = 0.0f, replayTo = 0.0f;
-    // Victory replay: span covering the battle's end, frozen the moment
-    // victory hits (the buffer keeps recording the post-victory tour).
-    float vreplayFrom = 0.0f, vreplayTo = 0.0f;
+    // Victory replay: the span is computed when R is pressed — the battle's
+    // end plus a few seconds of aftermath (the buffer keeps recording the
+    // post-victory tour, so the wreck-burning aftermath is in there).
+    float victoryTime = 0.0f;
     bool vreplayAvail = false;
 
     // (Re)build everything for maps[mapIdx]: village, terrain, towers,
@@ -2145,12 +2304,18 @@ int main() {
                 replayPlayStart = (float)GetTime();
             }
         } else if (victory && IsKeyPressed(KEY_R)) {
-            // Victory panel: watch the end-of-battle replay.
-            if (vreplayAvail) {
-                replayFrom = vreplayFrom;
-                replayTo = vreplayTo;
-                replaying = true;
-                replayPlayStart = GetTime();
+            // Victory panel: watch the end-of-battle replay, including a few
+            // seconds of aftermath. Resolved live so the aftermath is in the
+            // buffer; if the victory footage aged out, R does nothing.
+            if (vreplayAvail && !replayBuf.empty()) {
+                float to = fminf(replayBuf.back().time, victoryTime + cfg.replayPostSeconds);
+                float from = fmaxf(replayBuf.front().time, victoryTime - cfg.replayDuration);
+                if (to > from + 1.0f) {
+                    replayFrom = from;
+                    replayTo = to;
+                    replaying = true;
+                    replayPlayStart = GetTime();
+                }
             }
         } else if (victory && IsKeyPressed(KEY_ENTER)) {
             // Victory panel: start a new mission on the current map.
@@ -2378,11 +2543,10 @@ int main() {
             if (!anyAlive) {
                 victory = true;
                 if (battleEnd == 0.0) battleEnd = GetTime();
-                // Freeze the victory-replay span now: the buffer keeps
-                // recording the post-victory tour, so pin the battle's end.
+                // Pin the victory moment; the replay span (battle end +
+                // aftermath) is resolved when R is pressed.
                 if (cfg.replayEnabled && replayBuf.size() >= 30) {
-                    vreplayTo = replayBuf.back().time;
-                    vreplayFrom = fmaxf(replayBuf.front().time, vreplayTo - cfg.replayDuration);
+                    victoryTime = (float)GetTime();
                     vreplayAvail = true;
                 }
             }
@@ -2398,7 +2562,8 @@ int main() {
                                       a.deathT, a.turretPos, a.turretSpin });
             for (const auto &e : enemies)
                 fr.enemies.push_back({ e.pos, e.hullAngle, e.turretAngle, e.alive,
-                                      e.deathT, e.turretPos, e.turretSpin });
+                                      e.deathT, e.turretPos, e.turretSpin,
+                                      e.kind, e.walkPhase, e.fallAxis });
             for (const auto &s : shells) {
                 if (fr.shells.size() >= 40) break;
                 fr.shells.push_back({ s.pos });
@@ -2424,7 +2589,7 @@ int main() {
                                  tank.pos.z + behind.z * cfg.chaseCamDist };
             fr.camTarget = Vector3{ tank.pos.x, tank.pos.y + 2.0f, tank.pos.z };
             replayBuf.push_back(std::move(fr));
-            size_t maxFrames = (size_t)(cfg.replayDuration * 20.0f * 1.5f);
+            size_t maxFrames = (size_t)((cfg.replayDuration + cfg.replayPostSeconds) * 20.0f * 1.5f);
             while (replayBuf.size() > maxFrames) replayBuf.pop_front();
         }
         // Wrecks block enemies too; enemies keep separation from each other.
@@ -2573,7 +2738,7 @@ int main() {
                                replayNow - replayFrom);
             // Replay chrome: label, progress bar, skip hint.
             DrawRectangle(0, 0, screenWidth, 36, Color{ 0, 0, 0, 160 });
-            DrawText(TextFormat("REPLAY - last %ds (full visibility)", (int)cfg.replayDuration),
+            DrawText(TextFormat("REPLAY - %.0fs (full visibility)", replayTo - replayFrom),
                      12, 8, 20, YELLOW);
             DrawText("R to skip", screenWidth - 110, 8, 20, LIGHTGRAY);
             float prog = (replayTo > replayFrom)
@@ -2834,9 +2999,16 @@ int main() {
             DrawText("VICTORY", tx, ty, 40, GREEN);
             DrawText("Arena cleared! (free tour)", tx, ty + 52, 20, LIGHTGRAY);
             battleStats(tx, ty + 88, 28, WHITE);
+            // Offer the replay only while the victory footage is still buffered.
+            bool canReplay = false;
+            if (vreplayAvail && !replayBuf.empty()) {
+                float to = fminf(replayBuf.back().time, victoryTime + cfg.replayPostSeconds);
+                float from = fmaxf(replayBuf.front().time, victoryTime - cfg.replayDuration);
+                canReplay = (to > from + 1.0f);
+            }
             if (((int)(GetTime() * 2.0) % 2) == 0) {
                 int hy = ty + 88 + 28 * 4 + 8;
-                if (vreplayAvail) {
+                if (canReplay) {
                     DrawText("R - watch replay", tx, hy, 22, GREEN);
                     hy += 30;
                 }

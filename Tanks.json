@@ -67,7 +67,8 @@
   },
   "replay": {
     "enabled": true,
-    "durationSeconds": 10.0
+    "durationSeconds": 10.0,
+    "postVictorySeconds": 4.0
   },
   "ditch": {
     "slowFactor": 0.15,

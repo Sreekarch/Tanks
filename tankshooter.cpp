@@ -48,6 +48,9 @@ struct Config {
     float enemySpread      = 0.06f;   // radians of random aim error
     float enemyAimTime     = 1.2f;    // tracking (telegraph) before firing
     float enemyCoverWait   = 4.0f;    // seconds hidden before re-emerging
+    float staggerSeconds   = 0.55f;  // stumble duration: 1-2 quick backpedal steps
+    float staggerStepSpeed = 13.0f;  // backpedal speed while stumbling
+    float staggerDistance  = 0.8f;   // initial impact jolt (visual, front-loaded)
     // Ally
     int   allyCount        = 2;
     int   allyHits         = 2;
@@ -67,6 +70,7 @@ struct Config {
     bool  replayEnabled    = true;   // defeat replays the last seconds
     float replayDuration   = 10.0f;  // seconds of replay footage
     float replayPostSeconds = 4.0f;  // aftermath included in the victory replay
+    float replayPostDefeatSeconds = 4.0f;  // aftermath after the player's death
     // Ditches (tanks get stuck/slowed) and bridges
     float ditchSlowFactor  = 0.15f;  // speed multiplier inside a ditch
     float ditchDepth       = 3.0f;
@@ -121,6 +125,9 @@ static Config LoadConfig() {
         c.enemySpread      = enemy.value("aimSpread", c.enemySpread);
         c.enemyAimTime     = enemy.value("aimTime", c.enemyAimTime);
         c.enemyCoverWait   = enemy.value("coverWaitTime", c.enemyCoverWait);
+        c.staggerSeconds   = enemy.value("staggerSeconds", c.staggerSeconds);
+        c.staggerStepSpeed = enemy.value("staggerStepSpeed", c.staggerStepSpeed);
+        c.staggerDistance  = enemy.value("staggerDistance", c.staggerDistance);
         c.allyCount        = ally.value("count", c.allyCount);
         c.allyHits         = ally.value("hitsToDestroy", c.allyHits);
         c.allySpeed        = ally.value("speed", c.allySpeed);
@@ -157,6 +164,7 @@ static Config LoadConfig() {
         c.replayEnabled  = rp.value("enabled", c.replayEnabled);
         c.replayDuration = rp.value("durationSeconds", c.replayDuration);
         c.replayPostSeconds = rp.value("postVictorySeconds", c.replayPostSeconds);
+        c.replayPostDefeatSeconds = rp.value("postDefeatSeconds", c.replayPostDefeatSeconds);
         auto dt2 = j.value("ditch", nlohmann::json::object());
         c.ditchSlowFactor = dt2.value("slowFactor", c.ditchSlowFactor);
         c.ditchDepth      = dt2.value("depth", c.ditchDepth);
@@ -799,7 +807,7 @@ struct OrderPing {
 
 // Mechanical alien invader variants. Enemies are walkers now (red tanks
 // are retired); the AI underneath is unchanged.
-enum class WalkerKind { TRIPOD, CRAB, BIPED };
+enum class WalkerKind { TRIPEDAL, CRAB, BIPED };
 
 // Death replay: ring buffer of world snapshots (20 Hz, ~15 s) so the
 // defeat screen can replay the last seconds from the drone's point of view.
@@ -812,6 +820,7 @@ struct ReplayEnemySnap {
     Vector3 pos; float hullAngle, turretAngle; bool alive;
     float deathT; Vector3 turretPos; float turretSpin;
     WalkerKind kind; float walkPhase; Vector3 fallAxis;
+    float staggerT; Vector3 staggerDir;
 };
 struct ReplayShellSnap { Vector3 pos; };
 struct ReplayFlashSnap { Vector3 pos; float t, maxT, size; };
@@ -847,7 +856,7 @@ struct Particle {
 };
 
 // Enemy tank AI states (v0.5).
-enum class AIState { ADVANCE, SHOOT, SEEK_COVER, COVER_WAIT };
+enum class AIState { ADVANCE, SHOOT, SEEK_COVER, COVER_WAIT, STAGGER };
 
 // Enemy tank: AI-driven in v0.5 (advance / shoot / seek-cover).
 // On death the turret pops off ballistically and the hull becomes a
@@ -859,9 +868,11 @@ struct Enemy {
     int hp = 2;
     int maxHp = 2;
     bool alive = true;
-    WalkerKind kind = WalkerKind::TRIPOD;  // mechanical alien variant
+    WalkerKind kind = WalkerKind::TRIPEDAL;  // mechanical alien variant
     float walkPhase = 0.0f;   // leg animation phase, advanced by movement
     Vector3 fallAxis = { 1.0f, 0.0f, 0.0f };  // wreck collapse axis
+    float staggerT = 0.0f;    // hit reaction: staggers back + stumbles
+    Vector3 staggerDir = { 0.0f, 0.0f, 0.0f };  // knockback dir, away from the shot
     float fogFactor = 0.0f;   // fog of war: 0 = revealed, 1 = fully fogged
     float hitFlashT = 0.0f;   // white hit feedback timer
     // AI state.
@@ -1030,6 +1041,8 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
     e.aiTimer += dt;
     e.fireTimer += dt;
     if (e.hitFlashT > 0.0f) e.hitFlashT -= dt;
+    // Hit-reaction timer decays regardless of state.
+    if (e.staggerT > 0.0f) e.staggerT = fmaxf(0.0f, e.staggerT - dt);
 
     float dx = player.pos.x - e.pos.x, dz = player.pos.z - e.pos.z;
     float dist = sqrtf(dx * dx + dz * dz);
@@ -1078,8 +1091,8 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
                 Vector3 fwd = { sinf(fa), 0.0f, -cosf(fa) };
                 // Walkers fire from the ventral gun pod (low, in the hit band);
                 // tanks fire from the turret.
-                float muzzleY = (e.kind == WalkerKind::TRIPOD) ? 2.5f : 2.25f;
-                float muzzleD = (e.kind == WalkerKind::TRIPOD) ? 3.4f : 3.55f;
+                float muzzleY = (e.kind == WalkerKind::TRIPEDAL) ? 2.5f : 2.25f;
+                float muzzleD = (e.kind == WalkerKind::TRIPEDAL) ? 3.4f : 3.55f;
                 Vector3 muzzle = { e.pos.x + fwd.x * muzzleD, muzzleY, e.pos.z + fwd.z * muzzleD };
                 Shell s;
                 s.pos = muzzle;
@@ -1112,6 +1125,25 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
         if (e.aiTimer >= cfg.enemyCoverWait) {
             e.aiState = AIState::ADVANCE;
             e.aiTimer = 0.0f;
+        }
+        break;
+    }
+    case AIState::STAGGER: {
+        // Knocked off balance: quick backpedaling steps away from the shot,
+        // hull unturned, legs cycling fast — fighting to regain footing.
+        // staggerT (decayed at the top of the update) is the state clock.
+        float dm = DitchDepthAt(e.pos.x, e.pos.z, ditches, bridges) > 0.0f
+            ? cfg.ditchSlowFactor : 1.0f;
+        e.pos.x += e.staggerDir.x * cfg.staggerStepSpeed * dt * dm;
+        e.pos.z += e.staggerDir.z * cfg.staggerStepSpeed * dt * dm;
+        e.walkPhase += cfg.staggerStepSpeed * dt * dm * 2.0f;  // hurried steps
+        ResolveBuildingCollisions(e.pos, village);
+        if (e.staggerT <= 0.0f) {
+            // Footing regained: break off and seek cover behind a building.
+            e.coverPos = PickCover(e, player.pos, village);
+            e.aiState = AIState::SEEK_COVER;
+            e.aiTimer = 0.0f;
+            e.aimTimer = 0.0f;
         }
         break;
     }
@@ -1171,7 +1203,7 @@ static std::vector<Enemy> SpawnEnemies(int count, int hits, const std::vector<Bu
         if (bad) continue;
         Enemy e;
         e.pos = { x, 0.0f, z };
-        e.kind = WalkerKind::TRIPOD;
+        e.kind = WalkerKind::TRIPEDAL;
         e.hullAngle = (float)GetRandomValue(0, 360) * DEG2RAD;
         e.turretAngle = (float)GetRandomValue(-60, 60) * DEG2RAD;
         e.hp = e.maxHp = hits;
@@ -1402,14 +1434,19 @@ static void UpdateAllies(std::vector<Ally> &allies, const Tank &player,
 // ---------------------------------------------------------------------------
 
 static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
-                        std::vector<Flash> &flashes, const Vector3 &playerPos,
-                        const std::vector<Building> &village) {
+                        std::vector<Flash> &flashes,
+                        const std::vector<Building> &village, const Config &cfg,
+                        const Vector3 &hitDir) {
     if (!e.alive) return;
     e.hitFlashT = 0.18f;
     if (--e.hp > 0) {
-        // Nonlethal hit: break off and seek cover behind a building.
-        e.coverPos = PickCover(e, playerPos, village);
-        e.aiState = AIState::SEEK_COVER;
+        // Nonlethal hit: the walker is knocked off balance and stumbles back
+        // (STAGGER state); when it regains its footing it breaks off to cover.
+        e.staggerT = cfg.staggerSeconds;
+        float hl = sqrtf(hitDir.x * hitDir.x + hitDir.z * hitDir.z);
+        e.staggerDir = (hl > 0.001f) ? Vector3{ hitDir.x / hl, 0.0f, hitDir.z / hl }
+                                     : Vector3{ 0.0f, 0.0f, 0.0f };
+        e.aiState = AIState::STAGGER;
         e.aiTimer = 0.0f;
         e.aimTimer = 0.0f;
         return;
@@ -1417,13 +1454,13 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
     // Kill: fireball flash, flame + smoke burst, head/turret pops off.
     e.alive = false;
     e.deathT = 0.0f;
-    float burstY = (e.kind == WalkerKind::TRIPOD) ? 2.8f : 1.6f;
+    float burstY = (e.kind == WalkerKind::TRIPEDAL) ? 2.8f : 1.6f;
     Vector3 c = { e.pos.x, burstY, e.pos.z };
     flashes.push_back(Flash{ c, 0.55f, 0.55f, 3.8f });
     Burst(particles, c, 10, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 0.9f, 0.7f, 6.0f);   // flames
     Burst(particles, c, 12, Color{ 90, 85, 80, 255 }, 4.0f, 9.0f, 1.4f, 2.6f, -3.0f);    // smoke
     Burst(particles, c, 6, Color{ 255, 220, 120, 255 }, 14.0f, 5.0f, 0.5f, 0.4f, 10.0f);  // sparks
-    float headY = (e.kind == WalkerKind::TRIPOD) ? 4.5f : 2.25f;
+    float headY = (e.kind == WalkerKind::TRIPEDAL) ? 4.5f : 2.25f;
     e.turretPos = { e.pos.x, headY, e.pos.z };
     // Walkers keel over around a random horizontal axis as they die.
     float fa = (float)GetRandomValue(0, 360) * DEG2RAD;
@@ -1608,10 +1645,10 @@ static void DrawLimb(const Vector3 &a, const Vector3 &b, float r, Color c) {
     DrawCylinderEx(a, b, r, r * 0.7f, 8, c);
 }
 
-// Tripod walker chassis + legs in a local frame: origin on the ground under
+// Tripedal walker chassis + legs in a local frame: origin on the ground under
 // the walker, -Z forward, already yawed by the hull angle. crumple 0 = intact,
 // 1 = collapsed wreck (legs fold, chassis drops).
-static void DrawTripodLocal(float walkPhase, float bobY, Color body, Color metal,
+static void DrawTripedalLocal(float walkPhase, float bobY, Color body, Color metal,
                             Color dark, Color trim, float alpha, float crumple) {
     float chassisY = 3.0f + bobY - crumple * 1.7f;
     // Central armored pod (scaled sphere).
@@ -1656,13 +1693,17 @@ static void DrawTripodLocal(float walkPhase, float bobY, Color body, Color metal
 
 // Sensor head + ventral gun pod, yawed by the walker's aim (hull + turret).
 // World space; the head is the part that pops off on death.
-static void DrawTripodHead(const Enemy &e, Color armor, Color trim, Color glow, float alpha) {
+static void DrawTripedalHead(const Enemy &e, Vector3 base, float bobY, float leanDeg,
+                             Color armor, Color trim, Color glow, float alpha) {
     float headA = e.hullAngle + e.turretAngle;
     Vector3 hd = { sinf(headA), 0.0f, -cosf(headA) };
-    float bobY = sinf(e.walkPhase * 2.0f) * 0.08f;
+    // The head rides the body's stagger lean: higher parts shift further
+    // along the knockback direction.
+    float leanK = tanf(leanDeg * DEG2RAD);
+    Vector3 lx = { e.staggerDir.x * leanK, 0.0f, e.staggerDir.z * leanK };
     // Neck from the pod top to the head.
-    Vector3 neckB = { e.pos.x + hd.x * 0.7f, 4.1f + bobY, e.pos.z + hd.z * 0.7f };
-    Vector3 hc = { e.pos.x + hd.x * 1.5f, 4.6f + bobY, e.pos.z + hd.z * 1.5f };
+    Vector3 neckB = { base.x + hd.x * 0.7f + lx.x * 4.1f, 4.1f + bobY, base.z + hd.z * 0.7f + lx.z * 4.1f };
+    Vector3 hc = { base.x + hd.x * 1.5f + lx.x * 4.6f, 4.6f + bobY, base.z + hd.z * 1.5f + lx.z * 4.6f };
     DrawLimb(neckB, hc, 0.3f, WithAlpha(armor, alpha));
     DrawSphere(hc, 0.8f, WithAlpha(armor, alpha));
     // Glowing sensor eye on the head's face.
@@ -1670,15 +1711,15 @@ static void DrawTripodHead(const Enemy &e, Color armor, Color trim, Color glow, 
     DrawSphere(eyeP, 0.3f, WithAlpha(glow, alpha));
     DrawSphere(eyeP, 0.16f, WithAlpha(Color{ 255, 255, 255, 255 }, alpha));
     // Ventral gun pod slung under the chassis, barrel forward.
-    Vector3 gunC = { e.pos.x + hd.x * 0.9f, 2.5f + bobY, e.pos.z + hd.z * 0.9f };
+    Vector3 gunC = { base.x + hd.x * 0.9f + lx.x * 2.5f, 2.5f + bobY, base.z + hd.z * 0.9f + lx.z * 2.5f };
     DrawSphere(gunC, 0.5f, WithAlpha(trim, alpha));
     Vector3 m1 = { gunC.x + hd.x * 2.5f, gunC.y, gunC.z + hd.z * 2.5f };
     DrawLimb(gunC, m1, 0.16f, WithAlpha(Color{ 30, 32, 38, 255 }, alpha));
     DrawSphere(m1, 0.2f, WithAlpha(glow, alpha));  // muzzle glow
 }
 
-// Living tripod walker.
-static void DrawTripodWalker(const Enemy &e, const Config &cfg, float alpha) {
+// Living tripedal walker.
+static void DrawTripedalWalker(const Enemy &e, const Config &cfg, float alpha) {
     static const Color GUNMETAL = { 52, 55, 62, 255 };
     static const Color LEGMETAL = { 70, 74, 82, 255 };
     static const Color DARKMETAL = { 30, 32, 38, 255 };
@@ -1690,18 +1731,32 @@ static void DrawTripodWalker(const Enemy &e, const Config &cfg, float alpha) {
         trim = Color{ 255, 240, 230, 255 };
         glow = Color{ 255, 255, 255, 255 };
     }
-    float bobY = sinf(e.walkPhase * 2.0f) * 0.08f;
+    // Hit reaction: an initial jolt along the shot, then the legs backpedal
+    // (STAGGER state) while the top leans back with a stumble wobble;
+    // st goes 1 (just hit) -> 0.
+    float st = (cfg.staggerSeconds > 0.001f)
+        ? Clamp(e.staggerT / cfg.staggerSeconds, 0.0f, 1.0f) : 0.0f;
+    Vector3 base = e.pos;
+    base.x += e.staggerDir.x * cfg.staggerDistance * st * st;  // sharp initial jolt
+    base.z += e.staggerDir.z * cfg.staggerDistance * st * st;
+    float bobY = sinf(e.walkPhase * 2.0f) * 0.08f - 0.35f * st;  // dips under the hit
+    float lean = 10.0f * st + sinf(st * 18.0f) * 5.0f * st;      // lean back + stumble
+    float roll = sinf(st * 14.0f) * 7.0f * st;                   // side-to-side wobble
     rlPushMatrix();
-    rlTranslatef(e.pos.x, 0.0f, e.pos.z);
+    rlTranslatef(base.x, 0.0f, base.z);
+    if (st > 0.001f) {
+        rlRotatef(lean, e.staggerDir.z, 0.0f, -e.staggerDir.x);
+        rlRotatef(roll, e.staggerDir.x, 0.0f, e.staggerDir.z);
+    }
     rlRotatef(-e.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    DrawTripodLocal(e.walkPhase, bobY, GUNMETAL, LEGMETAL, DARKMETAL, trim, alpha, 0.0f);
+    DrawTripedalLocal(e.walkPhase, bobY, GUNMETAL, LEGMETAL, DARKMETAL, trim, alpha, 0.0f);
     rlPopMatrix();
-    DrawTripodHead(e, GUNMETAL, trim, glow, alpha);
+    DrawTripedalHead(e, base, bobY, lean, GUNMETAL, trim, glow, alpha);
 }
 
-// Dead tripod: chassis keeled over around its fall axis, legs crumpled,
+// Dead tripedal: chassis keeled over around its fall axis, legs crumpled,
 // sensor head popped off ballistically (drawn where it landed).
-static void DrawTripodWreck(const Enemy &e) {
+static void DrawTripedalWreck(const Enemy &e) {
     static const Color CHARRED = { 38, 33, 28, 255 };
     static const Color CHARRED2 = { 52, 48, 44, 255 };
     float tip = fminf(e.deathT * 2.2f, 1.05f);
@@ -1711,7 +1766,7 @@ static void DrawTripodWreck(const Enemy &e) {
     rlRotatef(tip * RAD2DEG, e.fallAxis.x, 0.0f, e.fallAxis.z);
     rlTranslatef(0.0f, -sink, 0.0f);
     rlRotatef(-e.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
-    DrawTripodLocal(e.walkPhase, 0.0f, CHARRED, CHARRED2, CHARRED, CHARRED2, 1.0f, 1.0f);
+    DrawTripedalLocal(e.walkPhase, 0.0f, CHARRED, CHARRED2, CHARRED, CHARRED2, 1.0f, 1.0f);
     rlPopMatrix();
     // The popped head where it landed.
     DrawSphere(e.turretPos, 0.8f, CHARRED);
@@ -1737,8 +1792,8 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
         bool faded = alpha < 0.99f;
         if (faded) rlDisableDepthMask();
         if (e.alive) {
-            if (e.kind == WalkerKind::TRIPOD) {
-                DrawTripodWalker(e, cfg, alpha);
+            if (e.kind == WalkerKind::TRIPEDAL) {
+                DrawTripedalWalker(e, cfg, alpha);
             } else {
                 Color armor = cfg.enemyColor;
                 if (e.hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
@@ -1748,15 +1803,15 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
             }
             // Tracking ping: pulsing red ring under an enemy with a lock.
             if (e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) {
-                float base = (e.kind == WalkerKind::TRIPOD) ? 3.6f : 2.8f;
+                float base = (e.kind == WalkerKind::TRIPEDAL) ? 3.6f : 2.8f;
                 float pulse = base + sinf(e.aimTimer * 14.0f) * 0.5f;
                 DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z }, pulse, pulse,
                                   0.12f, 24,
                                   Color{ 255, 40, 40, (unsigned char)(230 * alpha) });
             }
         } else {
-            if (e.kind == WalkerKind::TRIPOD) {
-                DrawTripodWreck(e);
+            if (e.kind == WalkerKind::TRIPEDAL) {
+                DrawTripedalWreck(e);
             } else {
                 // Burning wreck: charred hull, turret where it landed.
                 DrawTankHull(e.pos, e.hullAngle, CHARRED);
@@ -2016,6 +2071,7 @@ static void DrawReplay(const ReplayFrame &f,
         e.alive = re.alive; e.deathT = re.deathT;
         e.turretPos = re.turretPos; e.turretSpin = re.turretSpin;
         e.kind = re.kind; e.walkPhase = re.walkPhase; e.fallAxis = re.fallAxis;
+        e.staggerT = re.staggerT; e.staggerDir = re.staggerDir;
         e.fogFactor = 0.0f;  // replays show the full battlefield
         ens.push_back(e);
     }
@@ -2219,6 +2275,7 @@ int main() {
     int shotsFired = 0, shotsHit = 0, playerKills = 0;
     double battleStart = 0.0;
     double battleEnd = 0.0;
+    double playerDeathTime = 0.0;  // defeat aftermath window starts here
     DroneCam drone;
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
@@ -2264,6 +2321,7 @@ int main() {
         shotsFired = 0; shotsHit = 0; playerKills = 0;
         battleStart = 0.0;
         battleEnd = 0.0;
+        playerDeathTime = 0.0;
         mode = CamMode::DRONE;
         ResetDroneView(drone, tank);
         EnableCursor();
@@ -2297,7 +2355,7 @@ int main() {
         } else if (replayArmed && IsKeyPressed(KEY_R)) {
             // Skip the beat before the replay, land on the defeat panel.
             replayArmed = false;
-        } else if (gameOver && !victory && IsKeyPressed(KEY_R)) {
+        } else if (gameOver && !victory && battleEnd != 0.0 && IsKeyPressed(KEY_R)) {
             // Defeat panel: watch the replay again (any number of times).
             if (cfg.replayEnabled && replayBuf.size() >= 30) {
                 replaying = true;
@@ -2346,7 +2404,12 @@ int main() {
         // Declared here so game-over frames reuse the last live values.
         std::vector<Vector3> revealers;
 
-        if (!gameOver) {
+        // Defeat aftermath: after the player's death the sim keeps running for
+        // a few seconds (the wreck burns, the battle continues) before the
+        // freeze. The dead player can't drive or fire during it.
+        bool defeatAftermath = (gameOver && !victory && playerDeathTime != 0.0 &&
+                                battleEnd == 0.0);
+        if (!gameOver || defeatAftermath) {
 
         // Read the mouse once per frame. Deltas from the first few frames are
         // discarded: hiding/capturing the cursor can warp the pointer and
@@ -2388,7 +2451,8 @@ int main() {
             }
         }
 
-        UpdateTank(tank, village, ditches, bridges, dt, mode == CamMode::GUNNER,
+        UpdateTank(tank, village, ditches, bridges, dt,
+                   mode == CamMode::GUNNER && tank.hp > 0,
                    cfg.playerSpeed, cfg.ditchSlowFactor);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 
@@ -2398,7 +2462,7 @@ int main() {
         // in drone mode the turret fires along its current aim, so you can
         // watch the shells from outside.
         if ((IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsKeyDown(KEY_SPACE)) &&
-            fireCooldown <= 0.0f && phase == Phase::COMBAT) {
+            fireCooldown <= 0.0f && phase == Phase::COMBAT && tank.hp > 0) {
             FireShell(tank, shells, cfg);
             fireCooldown = cfg.shellCooldown;
             shotsFired++;
@@ -2442,18 +2506,13 @@ int main() {
                         Vector3 hc = { tank.pos.x, 1.6f, tank.pos.z };
                         flashes.push_back(Flash{ hc, 0.4f, 0.4f, 2.5f });
                         Burst(particles, hc, 8, Color{ 255, 150, 40, 255 }, 7.0f, 6.0f, 0.7f, 0.6f, 6.0f);
-                        if (tank.hp <= 0 && !victory) {
+                        if (tank.hp <= 0 && !victory && playerDeathTime == 0.0) {
                             gameOver = true;
-                            battleEnd = GetTime();
-                            // Arm the death replay if we have enough footage.
-                            if (cfg.replayEnabled && replayBuf.size() >= 30) {
-                                replayTo = replayBuf.back().time;
-                                replayFrom = fmaxf(replayBuf.front().time,
-                                                   replayTo - cfg.replayDuration);
-                                replayArmed = true;
-                                replayWaitUntil = (float)GetTime() + 1.0f;
-                            }
+                            playerDeathTime = GetTime();
                             replaying = false;
+                            // The sim keeps running for the defeat aftermath
+                            // (see below); the freeze + replay arm happen
+                            // once that window elapses.
                         }
                         // Post-victory tour: hits still flash, but the tank can't die.
                         if (victory && tank.hp < 1) tank.hp = 1;
@@ -2474,7 +2533,8 @@ int main() {
                     for (auto &e : enemies) {
                         if (ShellHitsEnemy(it->pos, cfg.shellRadius, e)) {
                             bool wasAlive = e.alive;
-                            DamageEnemy(e, particles, flashes, tank.pos, village);
+                            DamageEnemy(e, particles, flashes, village,
+                                        cfg, it->vel);
                             if (it->fromPlayer) {
                                 shotsHit++;
                                 if (wasAlive && !e.alive) playerKills++;
@@ -2537,7 +2597,7 @@ int main() {
         // Victory: the last enemy is destroyed. The battle is over — the map
         // stays navigable for a post-battle tour, but the player can no
         // longer lose (HP clamps at 1, see the shell-hit code).
-        if (!victory && phase == Phase::COMBAT) {
+        if (!victory && !gameOver && phase == Phase::COMBAT) {
             bool anyAlive = false;
             for (const auto &e : enemies) if (e.alive) { anyAlive = true; break; }
             if (!anyAlive) {
@@ -2552,7 +2612,8 @@ int main() {
             }
         }
         // Death-replay recorder: 20 Hz snapshots of the battlefield state.
-        if (cfg.replayEnabled && phase == Phase::COMBAT && !gameOver && (frameCount % 3 == 0)) {
+        if (cfg.replayEnabled && phase == Phase::COMBAT &&
+            (!gameOver || defeatAftermath) && (frameCount % 3 == 0)) {
             ReplayFrame fr;
             fr.time = (float)GetTime();
             fr.player = { tank.pos, tank.hullAngle, tank.turretAngle, tank.hp > 0,
@@ -2563,7 +2624,8 @@ int main() {
             for (const auto &e : enemies)
                 fr.enemies.push_back({ e.pos, e.hullAngle, e.turretAngle, e.alive,
                                       e.deathT, e.turretPos, e.turretSpin,
-                                      e.kind, e.walkPhase, e.fallAxis });
+                                      e.kind, e.walkPhase, e.fallAxis,
+                                      e.staggerT, e.staggerDir });
             for (const auto &s : shells) {
                 if (fr.shells.size() >= 40) break;
                 fr.shells.push_back({ s.pos });
@@ -2589,7 +2651,8 @@ int main() {
                                  tank.pos.z + behind.z * cfg.chaseCamDist };
             fr.camTarget = Vector3{ tank.pos.x, tank.pos.y + 2.0f, tank.pos.z };
             replayBuf.push_back(std::move(fr));
-            size_t maxFrames = (size_t)((cfg.replayDuration + cfg.replayPostSeconds) * 20.0f * 1.5f);
+            size_t maxFrames = (size_t)((cfg.replayDuration +
+                fmaxf(cfg.replayPostSeconds, cfg.replayPostDefeatSeconds)) * 20.0f * 1.5f);
             while (replayBuf.size() > maxFrames) replayBuf.pop_front();
         }
         // Wrecks block enemies too; enemies keep separation from each other.
@@ -2713,7 +2776,22 @@ int main() {
                 }
             }
         }
-        }  // end if (!gameOver)
+        }  // end if (!gameOver || defeatAftermath)
+
+        // End of the defeat aftermath: freeze the sim and arm the death
+        // replay, whose span covers the battle's end plus the aftermath.
+        if (defeatAftermath && GetTime() - playerDeathTime >= cfg.replayPostDefeatSeconds) {
+            battleEnd = GetTime();
+            if (cfg.replayEnabled && replayBuf.size() >= 30) {
+                replayTo = replayBuf.back().time;
+                replayFrom = fmaxf(replayBuf.front().time,
+                                   replayTo - cfg.replayDuration - cfg.replayPostDefeatSeconds);
+                replayArmed = true;
+                replayWaitUntil = (float)GetTime() + 1.0f;
+            }
+            replaying = false;
+        }
+
 
         // Defeat replay timing runs on the wall clock (the sim is frozen).
         if (replayArmed && GetTime() >= replayWaitUntil) {
@@ -2978,7 +3056,11 @@ int main() {
         }
         // Shared end-of-battle stats lines.
         auto battleStats = [&](int tx, int ty, int lh, Color c) {
-            int secs = battleStart > 0.0 ? (int)(battleEnd > 0.0 ? (int)(battleEnd - battleStart) : 0) : 0 ;
+            // Battle duration ends at the player's death (defeat) — the
+            // aftermath window after that isn't battle time.
+            double endT = (gameOver && !victory && playerDeathTime != 0.0)
+                ? playerDeathTime : battleEnd;
+            int secs = battleStart > 0.0 ? (int)(endT > 0.0 ? (int)(endT - battleStart) : 0) : 0 ;
             int destroyed = cfg.enemyCount - aliveCount;
             float acc = shotsFired > 0 ? 100.0f * shotsHit / shotsFired : 0.0f;
             DrawText(TextFormat("Time  %d:%02d", secs / 60, secs % 60), tx, ty, 20, c);
@@ -3014,7 +3096,7 @@ int main() {
                 }
                 DrawText("ENTER - new mission", tx, hy, 22, YELLOW);
             }
-        } else if (gameOver && !replaying && !replayArmed) {
+        } else if (gameOver && battleEnd != 0.0 && !replaying && !replayArmed) {
             // Integrated defeat panel: battle stats plus the replay, which
             // can be rewatched any number of times.
             int pw = 380, ph = 300;

@@ -34,6 +34,9 @@
     "hitsToDestroy": 2,
     "shootRange": 70.0,
     "speed": 10.0,
+    "staggerDistance": 0.8,
+    "staggerSeconds": 0.55,
+    "staggerStepSpeed": 13.0,
     "wreckBlocksMovement": true
   },
   "player": {
@@ -68,7 +71,8 @@
   "replay": {
     "enabled": true,
     "durationSeconds": 10.0,
-    "postVictorySeconds": 4.0
+    "postVictorySeconds": 4.0,
+    "postDefeatSeconds": 4.0
   },
   "ditch": {
     "slowFactor": 0.15,

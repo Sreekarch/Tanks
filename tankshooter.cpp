@@ -51,6 +51,7 @@ struct Config {
     float staggerSeconds   = 0.55f;  // stumble duration: 1-2 quick backpedal steps
     float staggerStepSpeed = 13.0f;  // backpedal speed while stumbling
     float staggerDistance  = 0.8f;   // initial impact jolt (visual, front-loaded)
+    float swaySeconds      = 0.8f;   // head tilt-away duration (rears up, settles)
     // Ally
     int   allyCount        = 2;
     int   allyHits         = 2;
@@ -128,6 +129,7 @@ static Config LoadConfig() {
         c.staggerSeconds   = enemy.value("staggerSeconds", c.staggerSeconds);
         c.staggerStepSpeed = enemy.value("staggerStepSpeed", c.staggerStepSpeed);
         c.staggerDistance  = enemy.value("staggerDistance", c.staggerDistance);
+        c.swaySeconds      = enemy.value("swaySeconds", c.swaySeconds);
         c.allyCount        = ally.value("count", c.allyCount);
         c.allyHits         = ally.value("hitsToDestroy", c.allyHits);
         c.allySpeed        = ally.value("speed", c.allySpeed);
@@ -564,6 +566,7 @@ struct Tank {
     float hullAngle   = 0.0f;  // radians, 0 = facing -Z
     float turretAngle = 0.0f;  // radians, relative to hull (rendering + stops)
     float aimAngle    = 0.0f;  // radians, world-space gun direction (stabilized sight)
+    float aimPitch    = 0.0f;  // radians, gun elevation (+ = up), mouse Y
     float speed       = 0.0f;
     int hp = 3;
     int maxHp = 3;
@@ -655,11 +658,14 @@ static void DrawTankHull(const Vector3 &pos, float hullAngle, Color armor, float
 
 // Barrel only. In gunner view the turret body is a translucent ghost but the
 // gun itself stays solid — the gunner needs to see where it's pointing.
-static void DrawTankBarrel(const Vector3 &center, float totalAngle, float alpha = 1.0f) {
+// pitch: gun elevation in radians (+ = muzzle up).
+static void DrawTankBarrel(const Vector3 &center, float totalAngle, float pitch,
+                           float alpha = 1.0f) {
     unsigned char a = (unsigned char)(255.0f * fmaxf(0.0f, fminf(1.0f, alpha)));
     rlPushMatrix();
     rlTranslatef(center.x, center.y, center.z);
     rlRotatef(-totalAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    rlRotatef(pitch * RAD2DEG, 1.0f, 0.0f, 0.0f);  // elevate the muzzle
     // Barrel: a cylinder laid along -Z (forward), breech at the turret wall.
     // After rotating -90 deg about X the +Y height axis points down -Z and
     // the barrel spans z -1.3 to -3.3 from the turret center.
@@ -675,7 +681,7 @@ static void DrawTankBarrel(const Vector3 &center, float totalAngle, float alpha 
 // totalAngle = hullAngle + turretAngle. Used attached for player/enemies,
 // and detached (with a spin) for a popped wreck turret.
 static void DrawTankTurret(const Vector3 &center, float totalAngle, Color armor,
-                           float alpha = 1.0f) {
+                           float alpha = 1.0f, float pitch = 0.0f) {
     unsigned char a = (unsigned char)(255.0f * fmaxf(0.0f, fminf(1.0f, alpha)));
     Color body = armor; body.a = a;
     rlPushMatrix();
@@ -685,7 +691,7 @@ static void DrawTankTurret(const Vector3 &center, float totalAngle, Color armor,
     // 0.7-tall cylinder spanning y -0.35..+0.35 around the center.
     DrawCylinder(Vector3{ 0, -0.35f, 0 }, 1.15f, 1.35f, 0.7f, 12, body);
     rlPopMatrix();
-    DrawTankBarrel(center, totalAngle, alpha);
+    DrawTankBarrel(center, totalAngle, pitch, alpha);
 }
 
 static void DrawTank(const Tank &t, bool gunnerView) {
@@ -695,11 +701,11 @@ static void DrawTank(const Tank &t, bool gunnerView) {
     float ta = t.hullAngle + t.turretAngle;
     if (!gunnerView) {
         // Solid turret in drone view.
-        DrawTankTurret(tc, ta, PLAYER_ARMOR);
+        DrawTankTurret(tc, ta, PLAYER_ARMOR, 1.0f, t.aimPitch);
     } else {
         // Gunner view: solid barrel now, translucent turret body later
         // (DrawTurretGhost) so the camera inside can see through it.
-        DrawTankBarrel(tc, ta);
+        DrawTankBarrel(tc, ta, t.aimPitch);
     }
 
     // Heading whisker so turret direction is readable from the drone.
@@ -809,6 +815,8 @@ struct OrderPing {
 // are retired); the AI underneath is unchanged.
 enum class WalkerKind { TRIPEDAL, CRAB, BIPED };
 
+
+
 // Death replay: ring buffer of world snapshots (20 Hz, ~15 s) so the
 // defeat screen can replay the last seconds from the drone's point of view.
 // Only the visual state is recorded — positions, damage, death anims.
@@ -821,6 +829,8 @@ struct ReplayEnemySnap {
     float deathT; Vector3 turretPos; float turretSpin;
     WalkerKind kind; float walkPhase; Vector3 fallAxis;
     float staggerT; Vector3 staggerDir;
+    float swayT; float gunPitch;
+    float swayPitchAmp, swayRollAmp, swayYawAmp;
 };
 struct ReplayShellSnap { Vector3 pos; };
 struct ReplayFlashSnap { Vector3 pos; float t, maxT, size; };
@@ -870,9 +880,16 @@ struct Enemy {
     bool alive = true;
     WalkerKind kind = WalkerKind::TRIPEDAL;  // mechanical alien variant
     float walkPhase = 0.0f;   // leg animation phase, advanced by movement
-    Vector3 fallAxis = { 1.0f, 0.0f, 0.0f };  // wreck collapse axis
+    Vector3 fallAxis = { 1.0f, 0.0f, 0.0f };
+
+  // wreck collapse axis
     float staggerT = 0.0f;    // hit reaction: staggers back + stumbles
     Vector3 staggerDir = { 0.0f, 0.0f, 0.0f };  // knockback dir, away from the shot
+    float swayT = 0.0f;       // head/turret tilt timer (rears up/away, then settles)
+    float swayPitchAmp = 0.0f;  // skyward tilt amplitude, rad
+    float swayRollAmp = 0.0f;   // lateral tilt-away amplitude, rad
+    float swayYawAmp = 0.0f;    // flinch-away yaw amplitude, rad
+    float gunPitch = 0.0f;    // gun pod elevation, radians (+ = up), set by AI
     float fogFactor = 0.0f;   // fog of war: 0 = revealed, 1 = fully fogged
     float hitFlashT = 0.0f;   // white hit feedback timer
     // AI state.
@@ -890,6 +907,34 @@ struct Enemy {
     bool turretLanded = false;
     float burnAccum = 0.0f;   // spawner accumulator for wreck smoke/flame
 };
+
+// Tripedal walker proportions (taller WotW-style fighting machine).
+static constexpr float WALKER_CHASSIS_Y = 4.05f;  // armored pod center height
+static constexpr float WALKER_NECK_Y    = 5.5f;   // head-assembly pivot height
+static constexpr float WALKER_GUN_DY    = -2.9f;  // gun pod below the neck pivot
+static constexpr float WALKER_GUN_FWD   = -1.0f;  // gun pod forward of the pivot
+static constexpr float WALKER_BARREL    = 2.5f;   // gun barrel length
+static constexpr float WALKER_GUN_Y     = WALKER_NECK_Y + WALKER_GUN_DY;  // ≈2.6
+
+// Muzzle world position + shot direction for a tripedal walker, given a head
+// yaw and gun pitch (radians, + = up). Mirrors the DrawTripedalHeadLocal
+// transform chain (yaw about the neck base, pitch about the gun center);
+// the sway is ignored — shots only fire from the aimed state.
+static void WalkerMuzzle(const Enemy &e, float yaw, float pitch,
+                         Vector3 *outPos, Vector3 *outDir) {
+    float H = e.hullAngle + yaw;
+    float sh = sinf(H), ch = cosf(H);
+    float cp = cosf(pitch), sp = sinf(pitch);
+    // Gun center in the hull-yawed frame, then the pitched muzzle offset.
+    float mx = 0.0f, my = WALKER_GUN_DY + WALKER_BARREL * sp,
+          mz = WALKER_GUN_FWD - WALKER_BARREL * cp;
+    outPos->x = e.pos.x + mx * ch - mz * sh;
+    outPos->y = WALKER_NECK_Y + my;
+    outPos->z = e.pos.z + mx * sh + mz * ch;
+    outDir->x = sh * cp;
+    outDir->y = sp;
+    outDir->z = -ch * cp;
+}
 
 // Allied tank orders (v0.6, issued in drone mode).
 enum class AllyOrder { FOLLOW, MOVE, HOLD, ATTACK };
@@ -923,19 +968,20 @@ struct Ally {
 };
 
 static Vector3 MuzzleWorldPos(const Tank &t) {
-    Vector3 fwd = TurretForward(t);
-    // Tip of the barrel: 3.3 forward of the turret center at barrel height.
-    // Pushed 0.25 further out so the flash sits just beyond the muzzle,
-    // where the round leaves — unambiguously at the tip, not the breech.
-    return Vector3{ t.pos.x + fwd.x * 3.55f, 2.25f, t.pos.z + fwd.z * 3.55f };
+    // Tip of the barrel, following the gun's elevation: 3.55 along the
+    // pitched gun direction from the turret center (barrel height 2.25).
+    float cp = cosf(t.aimPitch), sp = sinf(t.aimPitch);
+    float dx = sinf(t.aimAngle) * cp, dz = -cosf(t.aimAngle) * cp;
+    return Vector3{ t.pos.x + dx * 3.55f, 2.25f + sp * 3.55f, t.pos.z + dz * 3.55f };
 }
 
 static void FireShell(const Tank &t, std::vector<Shell> &shells, const Config &cfg) {
-    Vector3 fwd = TurretForward(t);
+    float cp = cosf(t.aimPitch), sp = sinf(t.aimPitch);
+    Vector3 dir = { sinf(t.aimAngle) * cp, sp, -cosf(t.aimAngle) * cp };
     Vector3 muzzle = MuzzleWorldPos(t);
     Shell s;
     s.pos = muzzle;
-    s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+    s.vel = Vector3Scale(dir, cfg.shellSpeed);
     s.life = cfg.shellLifetime;
     s.fromPlayer = true;
     s.trail[0] = muzzle;
@@ -1041,12 +1087,18 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
     e.aiTimer += dt;
     e.fireTimer += dt;
     if (e.hitFlashT > 0.0f) e.hitFlashT -= dt;
-    // Hit-reaction timer decays regardless of state.
+    // Hit-reaction timers decay regardless of state.
     if (e.staggerT > 0.0f) e.staggerT = fmaxf(0.0f, e.staggerT - dt);
+    if (e.swayT > 0.0f) e.swayT = fmaxf(0.0f, e.swayT - dt);
 
     float dx = player.pos.x - e.pos.x, dz = player.pos.z - e.pos.z;
     float dist = sqrtf(dx * dx + dz * dz);
-    Vector3 eye = { e.pos.x, 2.25f, e.pos.z };
+    // Tripedals aim the gun pod in elevation at the player's hull so the
+    // taller walker can still make the shot.
+    if (e.kind == WalkerKind::TRIPEDAL) {
+        e.gunPitch = Clamp(atan2f(1.6f - WALKER_GUN_Y, dist), -0.35f, 0.6f);
+    }
+    Vector3 eye = { e.pos.x, 3.2f, e.pos.z };
     Vector3 tgt = { player.pos.x, 2.0f, player.pos.z };
     bool los = !LosBlocked(eye, tgt, village);
     bool inRange = dist < cfg.enemyRange;
@@ -1089,14 +1141,20 @@ static void UpdateEnemyAI(Enemy &e, const Tank &player, const std::vector<Buildi
                 float spread = ((float)GetRandomValue(-100, 100) / 100.0f) * cfg.enemySpread;
                 float fa = e.hullAngle + e.turretAngle + spread;
                 Vector3 fwd = { sinf(fa), 0.0f, -cosf(fa) };
-                // Walkers fire from the ventral gun pod (low, in the hit band);
-                // tanks fire from the turret.
-                float muzzleY = (e.kind == WalkerKind::TRIPEDAL) ? 2.5f : 2.25f;
-                float muzzleD = (e.kind == WalkerKind::TRIPEDAL) ? 3.4f : 3.55f;
-                Vector3 muzzle = { e.pos.x + fwd.x * muzzleD, muzzleY, e.pos.z + fwd.z * muzzleD };
                 Shell s;
+                Vector3 muzzle;
+                if (e.kind == WalkerKind::TRIPEDAL) {
+                    // Walkers fire from the elevating ventral gun pod.
+                    Vector3 mdir;
+                    WalkerMuzzle(e, e.turretAngle + spread, e.gunPitch, &muzzle, &mdir);
+                    s.vel = Vector3Scale(mdir, cfg.shellSpeed);
+                } else {
+                    // Tanks fire from the turret.
+                    float muzzleD = 3.55f;
+                    muzzle = { e.pos.x + fwd.x * muzzleD, 2.25f, e.pos.z + fwd.z * muzzleD };
+                    s.vel = Vector3Scale(fwd, cfg.shellSpeed);
+                }
                 s.pos = muzzle;
-                s.vel = Vector3Scale(fwd, cfg.shellSpeed);
                 s.life = cfg.shellLifetime;
                 s.fromEnemy = true;
                 shells.push_back(s);
@@ -1233,7 +1291,9 @@ static bool ShellHitsEnemy(const Vector3 &p, float r, const Enemy &e) {
     if (!e.alive) return false;
     float dx = p.x - e.pos.x, dz = p.z - e.pos.z;
     float rr = 2.2f + r;
-    return dx * dx + dz * dz < rr * rr && p.y > 0.0f && p.y < 3.2f;
+    // Tripedals stand ~7 tall (legs + pod + head); tanks are low.
+    float top = (e.kind == WalkerKind::TRIPEDAL) ? 7.0f : 3.2f;
+    return dx * dx + dz * dz < rr * rr && p.y > 0.0f && p.y < top;
 }
 
 static void Burst(std::vector<Particle> &ps, Vector3 c, int n,
@@ -1440,12 +1500,24 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
     if (!e.alive) return;
     e.hitFlashT = 0.18f;
     if (--e.hp > 0) {
-        // Nonlethal hit: the walker is knocked off balance and stumbles back
-        // (STAGGER state); when it regains its footing it breaks off to cover.
+        // Nonlethal hit: the head/turret cranes skywards and away from the
+        // incoming shot while the body stumbles back (STAGGER state); when
+        // the walker regains its footing it breaks off to cover.
         e.staggerT = cfg.staggerSeconds;
+        e.swayT = cfg.swaySeconds;
         float hl = sqrtf(hitDir.x * hitDir.x + hitDir.z * hitDir.z);
         e.staggerDir = (hl > 0.001f) ? Vector3{ hitDir.x / hl, 0.0f, hitDir.z / hl }
                                      : Vector3{ 0.0f, 0.0f, 0.0f };
+        float hy = e.hullAngle + e.turretAngle;
+        // Skyward crane: shots come from below, so the head rears up hard.
+        e.swayPitchAmp = 0.85f;
+        // Lateral tilt away from the shot.
+        float hrx = -cosf(hy), hrz = -sinf(hy);  // head right
+        float side = e.staggerDir.x * hrx + e.staggerDir.z * hrz;
+        e.swayRollAmp = side * 0.5f;
+        // Yaw flinch away from the shot.
+        float awayYaw = atan2f(e.staggerDir.x, -e.staggerDir.z);
+        e.swayYawAmp = Clamp(NormalizeAngle(awayYaw - hy), -0.7f, 0.7f);
         e.aiState = AIState::STAGGER;
         e.aiTimer = 0.0f;
         e.aimTimer = 0.0f;
@@ -1454,13 +1526,13 @@ static void DamageEnemy(Enemy &e, std::vector<Particle> &particles,
     // Kill: fireball flash, flame + smoke burst, head/turret pops off.
     e.alive = false;
     e.deathT = 0.0f;
-    float burstY = (e.kind == WalkerKind::TRIPEDAL) ? 2.8f : 1.6f;
+    float burstY = (e.kind == WalkerKind::TRIPEDAL) ? 3.8f : 1.6f;
     Vector3 c = { e.pos.x, burstY, e.pos.z };
     flashes.push_back(Flash{ c, 0.55f, 0.55f, 3.8f });
     Burst(particles, c, 10, Color{ 255, 150, 40, 255 }, 9.0f, 7.0f, 0.9f, 0.7f, 6.0f);   // flames
     Burst(particles, c, 12, Color{ 90, 85, 80, 255 }, 4.0f, 9.0f, 1.4f, 2.6f, -3.0f);    // smoke
     Burst(particles, c, 6, Color{ 255, 220, 120, 255 }, 14.0f, 5.0f, 0.5f, 0.4f, 10.0f);  // sparks
-    float headY = (e.kind == WalkerKind::TRIPEDAL) ? 4.5f : 2.25f;
+    float headY = (e.kind == WalkerKind::TRIPEDAL) ? WALKER_NECK_Y + 0.6f : 2.25f;
     e.turretPos = { e.pos.x, headY, e.pos.z };
     // Walkers keel over around a random horizontal axis as they die.
     float fa = (float)GetRandomValue(0, 360) * DEG2RAD;
@@ -1650,20 +1722,20 @@ static void DrawLimb(const Vector3 &a, const Vector3 &b, float r, Color c) {
 // 1 = collapsed wreck (legs fold, chassis drops).
 static void DrawTripedalLocal(float walkPhase, float bobY, Color body, Color metal,
                             Color dark, Color trim, float alpha, float crumple) {
-    float chassisY = 3.0f + bobY - crumple * 1.7f;
+    float chassisY = WALKER_CHASSIS_Y + bobY - crumple * 2.2f;
     // Central armored pod (scaled sphere).
     rlPushMatrix();
     rlTranslatef(0.0f, chassisY, 0.0f);
-    rlScalef(1.5f, 0.95f, 1.5f);
+    rlScalef(1.6f, 1.0f, 1.6f);
     DrawSphere(Vector3{ 0.0f, 0.0f, 0.0f }, 1.5f, WithAlpha(body, alpha));
     rlPopMatrix();
     // Armor trim ring around the pod's equator.
-    DrawCylinder(Vector3{ 0.0f, chassisY - 0.15f, 0.0f }, 2.1f, 2.25f, 0.35f, 12,
+    DrawCylinder(Vector3{ 0.0f, chassisY - 0.15f, 0.0f }, 2.3f, 2.45f, 0.35f, 12,
                  WithAlpha(trim, alpha));
     // Twin sensor antennae with glowing tips.
     for (float sx : { -0.55f, 0.55f }) {
-        Vector3 ab = { sx, chassisY + 1.1f, 0.35f };
-        Vector3 at = { sx * 1.5f, chassisY + 2.1f, 0.5f };
+        Vector3 ab = { sx, chassisY + 1.2f, 0.35f };
+        Vector3 at = { sx * 1.5f, chassisY + 2.3f, 0.5f };
         DrawLimb(ab, at, 0.06f, WithAlpha(dark, alpha));
         DrawSphere(at, 0.13f, WithAlpha(trim, alpha));
     }
@@ -1671,51 +1743,69 @@ static void DrawTripedalLocal(float walkPhase, float bobY, Color body, Color met
     for (int i = 0; i < 3; ++i) {
         float a = (float)i * (2.0f * PI / 3.0f);
         Vector3 outward = { sinf(a), 0.0f, -cosf(a) };
-        Vector3 hip = { outward.x * 1.1f, chassisY - 0.3f, outward.z * 1.1f };
+        Vector3 hip = { outward.x * 1.2f, chassisY - 0.3f, outward.z * 1.2f };
         float ph = walkPhase + (float)i * (2.0f * PI / 3.0f);
         float stepping = (crumple > 0.5f) ? 0.0f : 1.0f;
-        float stride = sinf(ph) * 1.0f * stepping;
-        float lift = fmaxf(0.0f, sinf(ph + PI * 0.5f)) * 0.8f * stepping;
-        float spread = 2.9f - crumple * 1.3f;
+        float stride = sinf(ph) * 1.2f * stepping;
+        float lift = fmaxf(0.0f, sinf(ph + PI * 0.5f)) * 1.0f * stepping;
+        float spread = 3.3f - crumple * 1.5f;
         Vector3 foot = { outward.x * spread, lift - crumple * 0.3f,
                          outward.z * spread - stride };
-        Vector3 knee = { (hip.x + foot.x) * 0.5f + outward.x * 0.9f,
-                         (hip.y + foot.y) * 0.5f + 1.0f - crumple * 1.4f,
-                         (hip.z + foot.z) * 0.5f + outward.z * 0.9f };
-        DrawLimb(hip, knee, 0.28f, WithAlpha(metal, alpha));
-        DrawLimb(knee, foot, 0.2f, WithAlpha(dark, alpha));
+        Vector3 knee = { (hip.x + foot.x) * 0.5f + outward.x * 1.0f,
+                         (hip.y + foot.y) * 0.5f + 1.3f - crumple * 1.8f,
+                         (hip.z + foot.z) * 0.5f + outward.z * 1.0f };
+        DrawLimb(hip, knee, 0.3f, WithAlpha(metal, alpha));
+        DrawLimb(knee, foot, 0.22f, WithAlpha(dark, alpha));
         // Hip and knee joint pods in trim color.
-        DrawSphere(hip, 0.34f, WithAlpha(trim, alpha));
-        DrawSphere(knee, 0.26f, WithAlpha(metal, alpha));
-        DrawSphere(foot, 0.32f, WithAlpha(dark, alpha));
+        DrawSphere(hip, 0.36f, WithAlpha(trim, alpha));
+        DrawSphere(knee, 0.28f, WithAlpha(metal, alpha));
+        DrawSphere(foot, 0.34f, WithAlpha(dark, alpha));
     }
 }
 
 // Sensor head + ventral gun pod, yawed by the walker's aim (hull + turret).
 // World space; the head is the part that pops off on death.
-static void DrawTripedalHead(const Enemy &e, Vector3 base, float bobY, float leanDeg,
-                             Color armor, Color trim, Color glow, float alpha) {
-    float headA = e.hullAngle + e.turretAngle;
-    Vector3 hd = { sinf(headA), 0.0f, -cosf(headA) };
-    // The head rides the body's stagger lean: higher parts shift further
-    // along the knockback direction.
-    float leanK = tanf(leanDeg * DEG2RAD);
-    Vector3 lx = { e.staggerDir.x * leanK, 0.0f, e.staggerDir.z * leanK };
-    // Neck from the pod top to the head.
-    Vector3 neckB = { base.x + hd.x * 0.7f + lx.x * 4.1f, 4.1f + bobY, base.z + hd.z * 0.7f + lx.z * 4.1f };
-    Vector3 hc = { base.x + hd.x * 1.5f + lx.x * 4.6f, 4.6f + bobY, base.z + hd.z * 1.5f + lx.z * 4.6f };
-    DrawLimb(neckB, hc, 0.3f, WithAlpha(armor, alpha));
-    DrawSphere(hc, 0.8f, WithAlpha(armor, alpha));
+// Tripedal head + gun assembly, drawn in the walker's hull-yawed frame
+// (origin on the ground under the walker, -Z forward, already translated to
+// the knockback base and leaned by the body). The neck stays rooted; the
+// head yaws with the turret and sways away from hits; the ventral gun pod
+// pitches (aim elevation + hit rear-up) about its own center.
+static void DrawTripedalHeadLocal(const Enemy &e, float bobY, float yaw,
+                                  float pitchDeg, float rollDeg,
+                                  Color armor, Color trim,
+                                  Color glow, float alpha) {
+    static const Color DARKMETAL = { 30, 32, 38, 255 };
+    rlPushMatrix();
+    rlTranslatef(0.0f, WALKER_NECK_Y + bobY, 0.0f);
+    // Neck: pod top to head pivot (stays rooted while the head turns).
+    DrawLimb(Vector3{ 0.0f, 0.0f, 0.0f }, Vector3{ 0.0f, 0.8f, -0.3f },
+             0.3f, WithAlpha(armor, alpha));
+    // Head: yaws, then nods (pitch) and tilts (roll) on the pendulum.
+    rlPushMatrix();
+    rlTranslatef(0.0f, 0.8f, -0.3f);
+    rlRotatef(-yaw * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    rlRotatef(pitchDeg, 1.0f, 0.0f, 0.0f);
+    rlRotatef(rollDeg, 0.0f, 0.0f, 1.0f);
+    DrawSphere(Vector3{ 0.0f, 0.0f, 0.0f }, 0.8f, WithAlpha(armor, alpha));
     // Glowing sensor eye on the head's face.
-    Vector3 eyeP = { hc.x + hd.x * 0.68f, hc.y + 0.15f, hc.z + hd.z * 0.68f };
-    DrawSphere(eyeP, 0.3f, WithAlpha(glow, alpha));
-    DrawSphere(eyeP, 0.16f, WithAlpha(Color{ 255, 255, 255, 255 }, alpha));
-    // Ventral gun pod slung under the chassis, barrel forward.
-    Vector3 gunC = { base.x + hd.x * 0.9f + lx.x * 2.5f, 2.5f + bobY, base.z + hd.z * 0.9f + lx.z * 2.5f };
-    DrawSphere(gunC, 0.5f, WithAlpha(trim, alpha));
-    Vector3 m1 = { gunC.x + hd.x * 2.5f, gunC.y, gunC.z + hd.z * 2.5f };
-    DrawLimb(gunC, m1, 0.16f, WithAlpha(Color{ 30, 32, 38, 255 }, alpha));
-    DrawSphere(m1, 0.2f, WithAlpha(glow, alpha));  // muzzle glow
+    DrawSphere(Vector3{ 0.0f, 0.15f, -0.68f }, 0.3f, WithAlpha(glow, alpha));
+    DrawSphere(Vector3{ 0.0f, 0.15f, -0.68f }, 0.16f,
+               WithAlpha(Color{ 255, 255, 255, 255 }, alpha));
+    rlPopMatrix();
+    // Ventral gun pod slung below: same yaw, pitches about its own center,
+    // rolls with the head.
+    rlPushMatrix();
+    rlTranslatef(0.0f, WALKER_GUN_DY, WALKER_GUN_FWD);
+    rlRotatef(-yaw * RAD2DEG, 0.0f, 1.0f, 0.0f);
+    rlRotatef(pitchDeg, 1.0f, 0.0f, 0.0f);
+    rlRotatef(rollDeg, 0.0f, 0.0f, 1.0f);
+    DrawSphere(Vector3{ 0.0f, 0.0f, 0.0f }, 0.5f, WithAlpha(trim, alpha));
+    DrawLimb(Vector3{ 0.0f, 0.0f, 0.0f }, Vector3{ 0.0f, 0.0f, -WALKER_BARREL },
+             0.16f, WithAlpha(DARKMETAL, alpha));
+    DrawSphere(Vector3{ 0.0f, 0.0f, -WALKER_BARREL }, 0.2f,
+               WithAlpha(glow, alpha));  // muzzle glow
+    rlPopMatrix();
+    rlPopMatrix();
 }
 
 // Living tripedal walker.
@@ -1742,6 +1832,17 @@ static void DrawTripedalWalker(const Enemy &e, const Config &cfg, float alpha) {
     float bobY = sinf(e.walkPhase * 2.0f) * 0.08f - 0.35f * st;  // dips under the hit
     float lean = 10.0f * st + sinf(st * 18.0f) * 5.0f * st;      // lean back + stumble
     float roll = sinf(st * 14.0f) * 7.0f * st;                   // side-to-side wobble
+    // Head tilt: cranes skywards and away from the shot, then settles.
+    // sw goes 1 (impact) -> 0 (settled); u goes 0 -> 1.
+    float sw = (cfg.swaySeconds > 0.001f)
+        ? Clamp(e.swayT / cfg.swaySeconds, 0.0f, 1.0f) : 0.0f;
+    float u = 1.0f - sw;
+    // Rear-up envelope: snaps skywards, eases back through center with a
+    // slight nod, then settles.
+    float tilt = cosf(u * (float)PI) * expf(-2.0f * u);
+    float yawNow = e.turretAngle + e.swayYawAmp * expf(-2.5f * u);
+    float pitchNow = e.gunPitch + e.swayPitchAmp * tilt;
+    float rollNow = e.swayRollAmp * tilt;
     rlPushMatrix();
     rlTranslatef(base.x, 0.0f, base.z);
     if (st > 0.001f) {
@@ -1750,9 +1851,12 @@ static void DrawTripedalWalker(const Enemy &e, const Config &cfg, float alpha) {
     }
     rlRotatef(-e.hullAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
     DrawTripedalLocal(e.walkPhase, bobY, GUNMETAL, LEGMETAL, DARKMETAL, trim, alpha, 0.0f);
+    DrawTripedalHeadLocal(e, bobY, yawNow,
+                          pitchNow * RAD2DEG, rollNow * RAD2DEG,
+                          GUNMETAL, trim, glow, alpha);
     rlPopMatrix();
-    DrawTripedalHead(e, base, bobY, lean, GUNMETAL, trim, glow, alpha);
 }
+
 
 // Dead tripedal: chassis keeled over around its fall axis, legs crumpled,
 // sensor head popped off ballistically (drawn where it landed).
@@ -1774,8 +1878,8 @@ static void DrawTripedalWreck(const Enemy &e) {
                0.3f, CHARRED2);
     // Fire flicker on the collapsed chassis.
     float f = 0.75f + 0.25f * sinf(e.deathT * 13.0f);
-    DrawSphere(Vector3{ e.pos.x, 2.2f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
-    DrawSphere(Vector3{ e.pos.x + 0.5f, 2.0f, e.pos.z - 0.3f }, 0.35f * f,
+    DrawSphere(Vector3{ e.pos.x, 3.0f, e.pos.z }, 0.55f * f, Color{ 255, 120, 25, 210 });
+    DrawSphere(Vector3{ e.pos.x + 0.5f, 2.8f, e.pos.z - 0.3f }, 0.35f * f,
                Color{ 255, 190, 60, 190 });
 }
 
@@ -1803,7 +1907,7 @@ static void DrawEnemies(const std::vector<Enemy> &enemies, const Config &cfg) {
             }
             // Tracking ping: pulsing red ring under an enemy with a lock.
             if (e.aiState == AIState::SHOOT && e.aimTimer > 0.05f) {
-                float base = (e.kind == WalkerKind::TRIPEDAL) ? 3.6f : 2.8f;
+                float base = (e.kind == WalkerKind::TRIPEDAL) ? 4.2f : 2.8f;
                 float pulse = base + sinf(e.aimTimer * 14.0f) * 0.5f;
                 DrawCylinderWires(Vector3{ e.pos.x, 0.08f, e.pos.z }, pulse, pulse,
                                   0.12f, 24,
@@ -2072,6 +2176,9 @@ static void DrawReplay(const ReplayFrame &f,
         e.turretPos = re.turretPos; e.turretSpin = re.turretSpin;
         e.kind = re.kind; e.walkPhase = re.walkPhase; e.fallAxis = re.fallAxis;
         e.staggerT = re.staggerT; e.staggerDir = re.staggerDir;
+        e.swayT = re.swayT; e.gunPitch = re.gunPitch;
+        e.swayPitchAmp = re.swayPitchAmp; e.swayRollAmp = re.swayRollAmp;
+        e.swayYawAmp = re.swayYawAmp;
         e.fogFactor = 0.0f;  // replays show the full battlefield
         ens.push_back(e);
     }
@@ -2625,7 +2732,9 @@ int main() {
                 fr.enemies.push_back({ e.pos, e.hullAngle, e.turretAngle, e.alive,
                                       e.deathT, e.turretPos, e.turretSpin,
                                       e.kind, e.walkPhase, e.fallAxis,
-                                      e.staggerT, e.staggerDir });
+                                      e.staggerT, e.staggerDir,
+                                      e.swayT, e.gunPitch,
+                                      e.swayPitchAmp, e.swayRollAmp, e.swayYawAmp });
             for (const auto &s : shells) {
                 if (fr.shells.size() >= 40) break;
                 fr.shells.push_back({ s.pos });
@@ -2701,18 +2810,23 @@ int main() {
             // beneath a steady sight instead of dragging the camera along.
             // (This also fixes mouse X, which was inverted before.)
             tank.aimAngle += md.x * TURRET_SENS;
+            // Gun elevation: mouse Y raises/lowers the gun so the taller
+            // aliens can be targeted (clamped: slight depression, high elevation).
+            tank.aimPitch = Clamp(tank.aimPitch - md.y * TURRET_SENS, -0.15f, 0.65f);
             // Full 360 traverse, no stops: the turret follows the aim.
             tank.turretAngle = NormalizeAngle(tank.aimAngle - tank.hullAngle);
 
             Vector3 tp = TurretWorldPos(tank);
-            Vector3 af = { sinf(tank.aimAngle), 0.0f, -cosf(tank.aimAngle) };
+            float cp = cosf(tank.aimPitch), sp = sinf(tank.aimPitch);
+            Vector3 af = { sinf(tank.aimAngle) * cp, sp, -cosf(tank.aimAngle) * cp };
             // Gunner "in the turret": the camera sits at the turret ring near
             // the gun's height and looks along the stabilized aim. The turret
             // itself renders as a translucent ghost (DrawTurretGhost, after the
             // village) so the hull and the world stay visible through it — you
             // always know which way the tank is turned.
             camera.position = Vector3{ tp.x, tp.y + 0.65f, tp.z };
-            camera.target   = Vector3{ tp.x + af.x * 60.0f, tp.y + 0.65f, tp.z + af.z * 60.0f };
+            camera.target   = Vector3{ tp.x + af.x * 60.0f, tp.y + 0.65f + af.y * 60.0f,
+                                       tp.z + af.z * 60.0f };
         } else {
             UpdateDrone(drone, dt);
             Vector3 fwd = { sinf(drone.yaw) * cosf(drone.pitch), sinf(drone.pitch),
@@ -2791,6 +2905,12 @@ int main() {
             }
             replaying = false;
         }
+
+
+
+
+
+
 
 
         // Defeat replay timing runs on the wall clock (the sim is frozen).

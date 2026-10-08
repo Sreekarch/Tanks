@@ -37,6 +37,7 @@
     "staggerDistance": 0.8,
     "staggerSeconds": 0.55,
     "staggerStepSpeed": 13.0,
+    "swaySeconds": 0.9,
     "wreckBlocksMovement": true
   },
   "player": {

@@ -63,8 +63,8 @@
     "camDistance": 30.0
   },
   "gamepad": {
-    "driveSensitivity": 0.6,
-    "aimSensitivity": 10.0
+    "driveSensitivity": 0.5,
+    "aimSensitivity": 8.0
   },
   "fog": {
     "enabled": true,

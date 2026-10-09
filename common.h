@@ -108,6 +108,9 @@ struct Config {
     int   chaseHeight      = 180;
     float chaseCamHeight   = 26.0f;  // camera altitude above the tank
     float chaseCamDist     = 30.0f;  // camera distance behind the tank
+    // Gamepad stick sensitivities (keyboard/mouse unaffected)
+    float padDriveSens     = 0.6f;   // left stick: scales throttle/steer (and drone move)
+    float padAimSens       = 10.0f;  // right stick: mouse-pixel equivalents per frame
 };
 
 Config LoadConfig();

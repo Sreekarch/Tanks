@@ -62,6 +62,10 @@
     "camHeight": 26.0,
     "camDistance": 30.0
   },
+  "gamepad": {
+    "driveSensitivity": 0.6,
+    "aimSensitivity": 10.0
+  },
   "fog": {
     "enabled": true,
     "sightRadius": 90.0,

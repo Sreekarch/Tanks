@@ -86,6 +86,9 @@ Config LoadConfig() {
         c.chaseHeight    = cv.value("height", c.chaseHeight);
         c.chaseCamHeight = cv.value("camHeight", c.chaseCamHeight);
         c.chaseCamDist   = cv.value("camDistance", c.chaseCamDist);
+        auto gp = j.value("gamepad", nlohmann::json::object());
+        c.padDriveSens   = gp.value("driveSensitivity", c.padDriveSens);
+        c.padAimSens     = gp.value("aimSensitivity", c.padAimSens);
         auto fg = j.value("fog", nlohmann::json::object());
         c.fogEnabled     = fg.value("enabled", c.fogEnabled);
         c.fogSightRadius = fg.value("sightRadius", c.fogSightRadius);
@@ -1210,7 +1213,10 @@ int main() {
     double battleEnd = 0.0;
     double playerDeathTime = 0.0;  // defeat aftermath window starts here
     DroneCam drone;
-    KeyboardMouseInput input;  // the only raylib-input reader (polled once/frame)
+    KeyboardMouseInput input;  // raylib-input readers (polled once/frame)
+    GamepadInput padInput;     // first gamepad; inert when none is connected
+    padInput.driveSens = cfg.padDriveSens;  // stick feel from Tanks.json
+    padInput.aimSens = cfg.padAimSens;
     InputState in;              // refreshed at the top of every frame
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
@@ -1279,7 +1285,9 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
         // Poll input ONCE per frame; game logic reads `in`, never raylib.
+        // Keyboard/mouse and gamepad merge into the same InputState.
         in = input.poll();
+        MergeInput(in, padInput.poll());
 
         // Mouse ground point (drone mode), for the cursor + order raycast.
         Vector3 mouseGround = { 0, 0, 0 };
@@ -1947,13 +1955,13 @@ int main() {
         }
         if (mode == CamMode::DRONE) {
             int y0 = sy + 78 + (int)allies.size() * 22 + 6;
-            DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
-            DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
+            // DrawText("1/2 select ally   Right-click: move / attack   F follow   H hold", 16, y0, 18, DARKBLUE);
+            // DrawText("Arrows rotate view   WASD/QE move drone", 16, y0 + 22, 18, DARKBLUE);
         }
         // SETUP overlay: position forces, see the map, then start the battle.
         if (phase == Phase::SETUP) {
-            int pw = 540, ph = 260;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
+            int pw = 540, ph = 240;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 30;
             DrawRectangle(px, py, pw, ph, Color{ 10, 10, 20, 220 });
             DrawRectangleLines(px, py, pw, ph, SKYBLUE);
             int tx = px + 24, ty = py + 20;
@@ -1962,7 +1970,7 @@ int main() {
             DrawText(TextFormat("Map: %s   (M to change)", maps[mapIdx].name.c_str()),
                      tx, ty, 20, YELLOW);
             ty += 30;
-            DrawText(TextFormat("Enemy armor inbound: %d tanks (positions unknown)", cfg.enemyCount),
+            DrawText(TextFormat("Aliens inbound: %d walkers (positions unknown)", cfg.enemyCount),
                      tx, ty, 20, RED);
             ty += 34;
             DrawText("Position your forces before the battle begins:", tx, ty, 20, WHITE);
@@ -1971,8 +1979,8 @@ int main() {
                 DrawText("- Move the mouse to aim the cursor", tx, ty, 18, LIGHTGRAY);
                 ty += 26;
                 DrawText("- Right-click ground: send selected ally there", tx, ty, 18, LIGHTGRAY);
-                ty += 26;
-                DrawText("- Right-click enemy: order ally to attack it", tx, ty, 18, LIGHTGRAY);
+                // ty += 26;
+                // DrawText("- Right-click enemy: order ally to attack it", tx, ty, 18, LIGHTGRAY);
                 ty += 26;
                 DrawText("- 1/2 select ally,  F follow,  H hold position", tx, ty, 18, LIGHTGRAY);
                 // ty += 26;
@@ -2017,7 +2025,7 @@ int main() {
             // Victory panel mirrors the defeat panel: stats plus a rewatchable
             // replay of the battle's end. The tour continues behind it.
             int pw = 380, ph = 300;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 30;
             DrawRectangle(px, py, pw, ph, Color{ 8, 20, 12, 235 });
             DrawRectangleLines(px, py, pw, ph, GREEN);
             int tx = px + 30, ty = py + 24;
@@ -2043,7 +2051,7 @@ int main() {
             // Integrated defeat panel: battle stats plus the replay, which
             // can be rewatched any number of times.
             int pw = 380, ph = 300;
-            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 15;
+            int px = (screenWidth - pw) / 2, py = (screenHeight - ph) / 30;
             DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 150 });
             DrawRectangle(px, py, pw, ph, Color{ 20, 8, 8, 235 });
             DrawRectangleLines(px, py, pw, ph, RED);
@@ -2093,6 +2101,9 @@ int main() {
             DrawText("TURRET", (int)compC.x - 26, (int)compC.y + 44, 14, DARKGRAY);
         } 
         DrawFPS(screenWidth - 90, 12);
+        if (const char *padName = padInput.activeName()) {
+            DrawText(TextFormat("Gamepad: %s", padName), 12, screenHeight - 24, 14, GRAY);
+        }
 
         EndDrawing();
     }

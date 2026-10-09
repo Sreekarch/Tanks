@@ -49,7 +49,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 # --- the game ------------------------------------------------------------------
-add_executable(tankshooter tankshooter.cpp)
+add_executable(tankshooter tankshooter.cpp input.cpp tank.cpp walker.cpp)
 target_link_libraries(tankshooter PRIVATE raylib nlohmann_json::nlohmann_json)
 
 # Drop the binary at the build-tree root so it is easy to find.

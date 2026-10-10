@@ -22,6 +22,7 @@ class AlliedTank;
 class Walker;
 struct Tower;
 struct Building;
+struct NavGrid;
 struct Ditch;
 struct Bridge;
 struct Shell;
@@ -111,6 +112,11 @@ struct Config {
     // Gamepad stick sensitivities (keyboard/mouse unaffected)
     float padDriveSens     = 0.6f;   // left stick: scales throttle/steer (and drone move)
     float padAimSens       = 10.0f;  // right stick: mouse-pixel equivalents per frame
+    // Pathfinding (walkers + allies); off = legacy point-to-point steering
+    bool  pathEnabled      = true;
+    float pathCellSize     = 2.0f;   // nav grid resolution (world units)
+    float pathRepathSeconds = 0.75f; // max time between re-plans per entity
+    bool  pathDrawPaths    = false;  // debug: draw active paths in-world
 };
 
 Config LoadConfig();
@@ -266,6 +272,7 @@ struct GameCtx {
     const InputState &in;
     bool inCombat = false;
     float dt = 0.0f;
+    NavGrid *nav = nullptr;  // pathfinding grid (pathfind.h); null = direct steering
 };
 
 // Cross-file helpers (defined in tankshooter.cpp).

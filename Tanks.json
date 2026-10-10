@@ -66,6 +66,12 @@
     "driveSensitivity": 0.5,
     "aimSensitivity": 8.0
   },
+  "pathfinding": {
+    "enabled": true,
+    "cellSize": 2.0,
+    "repathSeconds": 0.75,
+    "drawPaths": false
+  },
   "fog": {
     "enabled": true,
     "sightRadius": 90.0,

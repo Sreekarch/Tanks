@@ -269,8 +269,15 @@ void AlliedTank::update(float dt, GameCtx &g, size_t index) {
             aimTimer = 0.0f;
         }
         // ATTACK order closes distance; otherwise hold while shooting.
-        if (order == AllyOrder::ATTACK && dist > cfg.allyRange * 0.7f)
-            driveToward(wantWorld, cfg.allySpeed, g);
+        if (order == AllyOrder::ATTACK && dist > cfg.allyRange * 0.7f) {
+            float steer = wantWorld;
+            if (g.nav) {
+                float a;
+                if (navPath.steer(*g.nav, pos, e.pos, dt,
+                                  cfg.pathRepathSeconds, a)) steer = a;
+            }
+            driveToward(steer, cfg.allySpeed, g);
+        }
     } else {
         // No target: follow orders.
         aimTimer = 0.0f;
@@ -293,7 +300,15 @@ void AlliedTank::update(float dt, GameCtx &g, size_t index) {
         if (move) {
             float dx = dest.x - pos.x, dz = dest.z - pos.z;
             if (dx * dx + dz * dz > 9.0f) {
-                driveToward(atan2f(dx, -dz), cfg.allySpeed, g);
+                // Pathfinding (if enabled) routes around buildings;
+                // otherwise steer straight at the destination.
+                float steer = atan2f(dx, -dz);
+                if (g.nav) {
+                    float a;
+                    if (navPath.steer(*g.nav, pos, dest, dt,
+                                      cfg.pathRepathSeconds, a)) steer = a;
+                }
+                driveToward(steer, cfg.allySpeed, g);
             } else if (order == AllyOrder::MOVE) {
                 order = AllyOrder::HOLD;  // arrived
             }
@@ -306,6 +321,8 @@ void AlliedTank::update(float dt, GameCtx &g, size_t index) {
 void AlliedTank::draw(const Config &cfg, bool isSelected,
                       const std::vector<std::unique_ptr<Walker>> &walkers) const {
     static const Color CHARRED = { 38, 33, 28, 255 };
+    if (cfg.pathDrawPaths && alive)
+        navPath.draw(pos, Color{ 100, 190, 255, 220 });  // blue route
     if (alive) {
         Color armor = cfg.allyColor;
         if (hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };

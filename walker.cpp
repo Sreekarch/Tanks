@@ -96,7 +96,17 @@ void Tripedal::update(float dt, GameCtx &g) {
     case AIState::ADVANCE: {
         float want = atan2f(dx, -dz);
         float throttleScale = (los && inRange && dist < cfg.enemyRange * 0.7f) ? 0.0f : 1.0f;
-        if (throttleScale > 0.0f) driveToward(want, cfg.enemySpeed, g);
+        if (throttleScale > 0.0f) {
+            // Pathfinding (if enabled): follow the A* route to the
+            // player; otherwise steer straight at them.
+            float steer = want;
+            if (g.nav) {
+                float a;
+                if (navPath.steer(*g.nav, pos, player.pos, dt,
+                                  cfg.pathRepathSeconds, a)) steer = a;
+            }
+            driveToward(steer, cfg.enemySpeed, g);
+        }
         // Turret relaxes toward hull-forward when not engaged.
         turretAngle = NormalizeAngle(turretAngle - turretAngle * fminf(dt * 2.0f, 1.0f));
         if (los && inRange) {
@@ -142,7 +152,13 @@ void Tripedal::update(float dt, GameCtx &g) {
             aiState = AIState::COVER_WAIT;
             aiTimer = 0.0f;
         } else {
-            driveToward(atan2f(cdx, -cdz), cfg.enemySpeed, g);
+            float steer = atan2f(cdx, -cdz);
+            if (g.nav) {
+                float a;
+                if (navPath.steer(*g.nav, pos, coverPos, dt,
+                                  cfg.pathRepathSeconds, a)) steer = a;
+            }
+            driveToward(steer, cfg.enemySpeed, g);
         }
         break;
     }
@@ -420,6 +436,8 @@ void Tripedal::drawWreck() const {
 void Tripedal::draw(float alpha, const Config &cfg) const {
     if (alive) drawWalker(cfg, alpha);
     else drawWreck();
+    if (cfg.pathDrawPaths && alive)
+        navPath.draw(pos, Color{ 255, 160, 60, 220 });  // orange route
 }
 
 std::vector<std::unique_ptr<Walker>> SpawnEnemies(int count, int hits,

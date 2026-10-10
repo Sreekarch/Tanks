@@ -12,6 +12,7 @@
 #include "common.h"
 #include "tank.h"
 #include "walker.h"
+#include "pathfind.h"
 
 #include <algorithm>
 #include <cstring>
@@ -89,6 +90,11 @@ Config LoadConfig() {
         auto gp = j.value("gamepad", nlohmann::json::object());
         c.padDriveSens   = gp.value("driveSensitivity", c.padDriveSens);
         c.padAimSens     = gp.value("aimSensitivity", c.padAimSens);
+        auto pf = j.value("pathfinding", nlohmann::json::object());
+        c.pathEnabled    = pf.value("enabled", c.pathEnabled);
+        c.pathCellSize   = pf.value("cellSize", c.pathCellSize);
+        c.pathRepathSeconds = pf.value("repathSeconds", c.pathRepathSeconds);
+        c.pathDrawPaths  = pf.value("drawPaths", c.pathDrawPaths);
         auto fg = j.value("fog", nlohmann::json::object());
         c.fogEnabled     = fg.value("enabled", c.fogEnabled);
         c.fogSightRadius = fg.value("sightRadius", c.fogSightRadius);
@@ -1217,6 +1223,7 @@ int main() {
     GamepadInput padInput;     // first gamepad; inert when none is connected
     padInput.driveSens = cfg.padDriveSens;  // stick feel from Tanks.json
     padInput.aimSens = cfg.padAimSens;
+    NavGrid navGrid;           // A* grid; entities use it when pathEnabled
     InputState in;              // refreshed at the top of every frame
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
@@ -1393,6 +1400,12 @@ int main() {
         GameCtx g{ tank, enemies, allies, towers, village, ditches, bridges,
                    shells, flashes, particles, cfg, in,
                    phase == Phase::COMBAT, dt };
+        // Pathfinding grid: rebuilt only when the village/towers change.
+        if (cfg.pathEnabled) {
+            navGrid.EnsureBuilt(village, towers, ditches, bridges,
+                                cfg.pathCellSize);
+            g.nav = &navGrid;
+        }
         tank.update(dt, in, g, mode == CamMode::GUNNER && tank.hp > 0);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 

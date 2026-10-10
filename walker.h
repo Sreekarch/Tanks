@@ -4,6 +4,7 @@
 // same way; the game loop only ever talks to Walker.
 
 #include "common.h"
+#include "pathfind.h"
 
 // Tripedal proportions (taller WotW-style fighting machine).
 static constexpr float WALKER_CHASSIS_Y = 4.05f;  // armored pod center height
@@ -53,6 +54,8 @@ public:
     virtual WalkerKind kind() const = 0;
     virtual void update(float dt, GameCtx &g) = 0;
     virtual void draw(float alpha, const Config &cfg) const = 0;
+
+    PathFollower navPath;  // route to the current AI destination (if pathEnabled)
 
     // Nonlethal hit: hit reaction + stagger; lethal hit: kill sequence.
     void damage(GameCtx &g, const Vector3 &hitDir);

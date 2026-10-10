@@ -3,6 +3,7 @@
 // Both are Collidable so the one-pass ResolveCollisions() covers them.
 
 #include "common.h"
+#include "pathfind.h"
 
 class PlayerTank : public Collidable {
 public:
@@ -47,6 +48,7 @@ public:
     float aimTimer = 0.0f;
     float fireTimer = 0.0f;
     int engageIdx = -1;             // enemy currently being shot at
+    PathFollower navPath;           // route to order destination (if pathEnabled)
     // Death animation (same as Walker).
     float deathT = 0.0f;
     Vector3 turretPos = { 0.0f, 0.0f, 0.0f };

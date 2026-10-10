@@ -95,6 +95,20 @@ Config LoadConfig() {
         c.pathCellSize   = pf.value("cellSize", c.pathCellSize);
         c.pathRepathSeconds = pf.value("repathSeconds", c.pathRepathSeconds);
         c.pathDrawPaths  = pf.value("drawPaths", c.pathDrawPaths);
+        auto st = j.value("stealth", nlohmann::json::object());
+        c.stealthEnabled = st.value("enabled", c.stealthEnabled);
+        c.nightMode      = st.value("nightMode", c.nightMode);
+        c.visionRange    = st.value("visionRange", c.visionRange);
+        c.visionHalfAngleDeg = st.value("visionHalfAngleDegrees", c.visionHalfAngleDeg);
+        c.detectSeconds  = st.value("detectSeconds", c.detectSeconds);
+        c.forgetSeconds  = st.value("forgetSeconds", c.forgetSeconds);
+        c.alarmSeconds   = st.value("alarmSeconds", c.alarmSeconds);
+        c.alarmRadius    = st.value("alarmRadius", c.alarmRadius);
+        c.noiseRadius    = st.value("noiseRadius", c.noiseRadius);
+        c.memorySeconds  = st.value("memorySeconds", c.memorySeconds);
+        c.searchSeconds  = st.value("searchSeconds", c.searchSeconds);
+        c.patrolSpeedFactor = st.value("patrolSpeedFactor", c.patrolSpeedFactor);
+        c.patrolPauseSeconds = st.value("patrolPauseSeconds", c.patrolPauseSeconds);
         auto fg = j.value("fog", nlohmann::json::object());
         c.fogEnabled     = fg.value("enabled", c.fogEnabled);
         c.fogSightRadius = fg.value("sightRadius", c.fogSightRadius);
@@ -320,10 +334,31 @@ static std::vector<Building> BuildVillage(int hitsToDestroy, int seed) {
 
 // Ground with holes cut for ditches (tiled so pits are real openings),
 // plus ditch pit walls/floors.
-static void DrawGround(const std::vector<Ditch> &ditches) {
+// Night ops: with stealth on, the scene drops to dusk so searchlights
+// (and muzzle flashes, tower beacons) read as actual light sources.
+static bool NightOn(const Config &cfg) { return cfg.stealthEnabled && cfg.nightMode; }
+
+// Ground reference grid: raylib's DrawGrid by day; at night a faint
+// arena-bounded grid so lines don't float out into the dark.
+static void DrawSceneGrid(const Config &cfg) {
+    if (!NightOn(cfg)) { DrawGrid(40, 20.0f); return; }
+    Color c = { 96, 118, 158, 60 };
+    for (float v = -ARENA_HALF; v <= ARENA_HALF + 0.1f; v += 20.0f) {
+        DrawLine3D(Vector3{ v, 0.1f, -ARENA_HALF }, Vector3{ v, 0.1f, ARENA_HALF }, c);
+        DrawLine3D(Vector3{ -ARENA_HALF, 0.1f, v }, Vector3{ ARENA_HALF, 0.1f, v }, c);
+    }
+}
+
+static Color DimColor(Color c, float f) {
+    return Color{ (unsigned char)(c.r * f), (unsigned char)(c.g * f),
+                  (unsigned char)(c.b * f), c.a };
+}
+
+static void DrawGround(const std::vector<Ditch> &ditches, const Config &cfg) {
     const float tile = 20.0f;
-    Color gc = { 168, 148, 118, 255 };
-    Color dirt = { 140, 118, 90, 255 };
+    bool night = NightOn(cfg);
+    Color gc = night ? Color{ 43, 42, 44, 255 } : Color{ 168, 148, 118, 255 };
+    Color dirt = night ? Color{ 33, 31, 33, 255 } : Color{ 140, 118, 90, 255 };
     for (float x = -ARENA_HALF; x < ARENA_HALF; x += tile) {
         for (float z = -ARENA_HALF; z < ARENA_HALF; z += tile) {
             float cx = x + tile * 0.5f, cz = z + tile * 0.5f;
@@ -340,8 +375,8 @@ static void DrawGround(const std::vector<Ditch> &ditches) {
     }
     // Ditch pits: floor + 4 walls.
     for (const auto &d : ditches) {
-        Color wall = { 101, 76, 52, 255 };
-        Color dark = { 50, 38, 26, 255 };
+        Color wall = night ? Color{ 52, 42, 30, 255 } : Color{ 101, 76, 52, 255 };
+        Color dark = night ? Color{ 18, 15, 12, 255 } : Color{ 50, 38, 26, 255 };
         DrawPlane(Vector3{ d.center.x, -d.depth, d.center.z },
                   Vector2{ d.hx * 2, d.hz * 2 }, dark);
         float wy = -d.depth * 0.5f;
@@ -352,28 +387,30 @@ static void DrawGround(const std::vector<Ditch> &ditches) {
     }
 }
 
-static void DrawBridges(const std::vector<Bridge> &bridges) {
+static void DrawBridges(const std::vector<Bridge> &bridges, const Config &cfg) {
+    float dim = NightOn(cfg) ? 0.5f : 1.0f;
     for (const auto &b : bridges) {
-        Color wood = { 139, 110, 70, 255 };
+        Color wood = DimColor(Color{ 139, 110, 70, 255 }, dim);
         DrawCube(Vector3{ b.center.x, 0.0f, b.center.z }, b.hx * 2, 0.5f, b.hz * 2, wood);
         // Rails.
         DrawCube(Vector3{ b.center.x - b.hx + 0.3f, 1.0f, b.center.z }, 0.3f, 1.0f, b.hz * 2,
-                 Color{ 100, 78, 50, 255 });
+                 DimColor(Color{ 100, 78, 50, 255 }, dim));
         DrawCube(Vector3{ b.center.x + b.hx - 0.3f, 1.0f, b.center.z }, 0.3f, 1.0f, b.hz * 2,
-                 Color{ 100, 78, 50, 255 });
+                 DimColor(Color{ 100, 78, 50, 255 }, dim));
     }
 }
 
-static void DrawTowers(const std::vector<Tower> &towers, int frameCount) {
+static void DrawTowers(const std::vector<Tower> &towers, int frameCount, const Config &cfg) {
+    float dim = NightOn(cfg) ? 0.45f : 1.0f;
     for (const auto &t : towers) {
         if (!t.alive) {
             // Rubble.
             DrawCylinder(Vector3{ t.pos.x, 0.5f, t.pos.z }, 3.2f, 3.8f, 1.0f, 8,
-                         Color{ 60, 58, 55, 255 });
+                         DimColor(Color{ 60, 58, 55, 255 }, dim));
             continue;
         }
-        Color concrete = t.hitFlashT > 0.0f ? WHITE : Color{ 130, 130, 135, 255 };
-        Color dark = t.hitFlashT > 0.0f ? WHITE : Color{ 70, 70, 78, 255 };
+        Color concrete = t.hitFlashT > 0.0f ? WHITE : DimColor(Color{ 130, 130, 135, 255 }, dim);
+        Color dark = t.hitFlashT > 0.0f ? WHITE : DimColor(Color{ 70, 70, 78, 255 }, dim);
         DrawCylinder(Vector3{ t.pos.x, 0.0f, t.pos.z }, 3.0f, 3.6f, 4.0f, 10, concrete);
         DrawCylinder(Vector3{ t.pos.x, 4.0f, t.pos.z }, 2.2f, 2.6f, 1.0f, 10, dark);
         rlPushMatrix();
@@ -392,7 +429,8 @@ static void DrawTowers(const std::vector<Tower> &towers, int frameCount) {
     }
 }
 
-static void DrawVillage(const std::vector<Building> &village) {
+static void DrawVillage(const std::vector<Building> &village, const Config &cfg) {
+    float dim = NightOn(cfg) ? 0.4f : 1.0f;
     for (const Building &b : village) {
         if (b.destroyed) {
             if (b.collapseT < 1.0f) {
@@ -404,25 +442,25 @@ static void DrawVillage(const std::vector<Building> &village) {
                 rlRotatef(t * 68.0f, b.fallAxis.x, 0.0f, b.fallAxis.z);
                 rlTranslatef(0.0f, b.center.y - t * b.size.y * 0.75f, 0.0f);
                 DrawCube(Vector3{ 0, 0, 0 }, b.size.x, b.size.y, b.size.z,
-                         Color{ 90, 82, 74, 255 });
+                         DimColor(Color{ 90, 82, 74, 255 }, dim));
                 rlPopMatrix();
             } else {
                 // Settled rubble: three low chunks where the building stood.
                 // Non-blocking (tank can drive over), purely visual cover.
                 float rx = b.size.x * 0.5f, rz = b.size.z * 0.5f;
                 DrawCube(Vector3{ b.center.x - rx * 0.3f, 0.6f, b.center.z + rz * 0.2f },
-                         rx * 0.9f, 1.2f, rz * 0.8f, Color{ 95, 88, 80, 255 });
+                         rx * 0.9f, 1.2f, rz * 0.8f, DimColor(Color{ 95, 88, 80, 255 }, dim));
                 DrawCube(Vector3{ b.center.x + rx * 0.35f, 0.45f, b.center.z - rz * 0.25f },
-                         rx * 0.7f, 0.9f, rz * 0.7f, Color{ 100, 92, 84, 255 });
+                         rx * 0.7f, 0.9f, rz * 0.7f, DimColor(Color{ 100, 92, 84, 255 }, dim));
                 DrawCube(Vector3{ b.center.x + rx * 0.05f, 0.9f, b.center.z + rz * 0.05f },
-                         rx * 0.5f, 1.8f, rz * 0.5f, Color{ 90, 82, 74, 255 });
+                         rx * 0.5f, 1.8f, rz * 0.5f, DimColor(Color{ 90, 82, 74, 255 }, dim));
             }
             continue;
         }
         // Damage tint: darkens as HP drops, so hits read visually.
         float f = 0.55f + 0.45f * ((float)b.hp / (float)b.maxHp);
-        Color c = Color{ (unsigned char)(b.color.r * f), (unsigned char)(b.color.g * f),
-                         (unsigned char)(b.color.b * f), 255 };
+        Color c = Color{ (unsigned char)(b.color.r * f * dim), (unsigned char)(b.color.g * f * dim),
+                         (unsigned char)(b.color.b * f * dim), 255 };
         DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
         DrawCubeWires(b.center, b.size.x, b.size.y, b.size.z, Color{ 0, 0, 0, 60 });
         // Darker "roof" cap so buildings read as 3D from the drone.
@@ -877,10 +915,14 @@ static void DrawFogPuffs(const Camera3D &camera, const std::vector<std::unique_p
     std::sort(puffs.begin(), puffs.end(),
               [](const FogPuff &a, const FogPuff &b) { return a.dist2 > b.dist2; });
     rlDisableDepthMask();
+    // At night the fog reads as low mist rather than a glowing bank.
+    Color puffTint = NightOn(cfg) ? Color{ 84, 94, 122, 0 }
+                                  : Color{ 232, 234, 240, 0 };
     for (const auto &p : puffs) {
         unsigned char a = (unsigned char)(255.0f * fminf(1.0f, p.alpha));
         if (a == 0) continue;
-        DrawBillboard(camera, puffTex, p.pos, p.size, Color{ 232, 234, 240, a });
+        puffTint.a = a;
+        DrawBillboard(camera, puffTex, p.pos, p.size, puffTint);
     }
     rlEnableDepthMask();
 }
@@ -893,7 +935,7 @@ static void DrawFogPuffs(const Camera3D &camera, const std::vector<std::unique_p
 // from the drone's point of view. Fog of war is intentionally off — the
 // point of the replay is to see (and learn from) the full battlefield.
 static void DrawReplayBuildings(const std::vector<Building> &village,
-                                const std::vector<ReplayBldSnap> &rb) {
+                                const std::vector<ReplayBldSnap> &rb, float dimFactor) {
     for (size_t i = 0; i < village.size() && i < rb.size(); ++i) {
         const Building &b = village[i];
         const ReplayBldSnap &r = rb[i];
@@ -910,15 +952,15 @@ static void DrawReplayBuildings(const std::vector<Building> &village,
             } else {
                 float rx = b.size.x * 0.5f, rz = b.size.z * 0.5f;
                 DrawCube(Vector3{ b.center.x - rx * 0.3f, 0.6f, b.center.z + rz * 0.2f },
-                         rx * 0.9f, 1.2f, rz * 0.8f, Color{ 95, 88, 80, 255 });
+                         rx * 0.9f, 1.2f, rz * 0.8f, DimColor(Color{ 95, 88, 80, 255 }, dimFactor));
                 DrawCube(Vector3{ b.center.x + rx * 0.35f, 0.45f, b.center.z - rz * 0.25f },
-                         rx * 0.7f, 0.9f, rz * 0.7f, Color{ 100, 92, 84, 255 });
+                         rx * 0.7f, 0.9f, rz * 0.7f, DimColor(Color{ 100, 92, 84, 255 }, dimFactor));
                 DrawCube(Vector3{ b.center.x + rx * 0.05f, 0.9f, b.center.z + rz * 0.05f },
-                         rx * 0.5f, 1.8f, rz * 0.5f, Color{ 90, 82, 74, 255 });
+                         rx * 0.5f, 1.8f, rz * 0.5f, DimColor(Color{ 90, 82, 74, 255 }, dimFactor));
             }
             continue;
         }
-        float f = 0.55f + 0.45f * ((float)r.hp / (float)b.maxHp);
+        float f = (0.55f + 0.45f * ((float)r.hp / (float)b.maxHp)) * dimFactor;
         Color c = Color{ (unsigned char)(b.color.r * f), (unsigned char)(b.color.g * f),
                          (unsigned char)(b.color.b * f), 255 };
         DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
@@ -982,10 +1024,10 @@ static void DrawReplay(const ReplayFrame &f,
     rc.projection = CAMERA_PERSPECTIVE;
 
     BeginMode3D(rc);
-    DrawGround(ditches);
-    DrawGrid(40, 20.0f);
-    DrawBridges(bridges);
-    DrawReplayBuildings(village, f.buildings);
+    DrawGround(ditches, cfg);
+    DrawSceneGrid(cfg);
+    DrawBridges(bridges, cfg);
+    DrawReplayBuildings(village, f.buildings, NightOn(cfg) ? 0.4f : 1.0f);
     DrawReplayTowers(towers, f.towers, replayTime);
     // Reconstruct temp tanks and reuse the regular draw paths.
     PlayerTank pt;
@@ -1141,13 +1183,13 @@ static void DrawChaseView(RenderTexture2D target, const PlayerTank &tank,
     cc.projection = CAMERA_PERSPECTIVE;
 
     BeginTextureMode(target);
-    ClearBackground(SKYBLUE);
+    ClearBackground(NightOn(cfg) ? Color{ 13, 16, 28, 255 } : SKYBLUE);
     BeginMode3D(cc);
-    DrawGround(ditches);
-    DrawGrid(40, 20.0f);
-    DrawBridges(bridges);
-    DrawVillage(village);
-    DrawTowers(towers, frameCount);
+    DrawGround(ditches, cfg);
+    DrawSceneGrid(cfg);
+    DrawBridges(bridges, cfg);
+    DrawVillage(village, cfg);
+    DrawTowers(towers, frameCount, cfg);
     tank.draw(false);  // solid, never the gunner ghost
     if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);
     DrawAllies(allies, enemies, cfg, selectedAlly);
@@ -1224,6 +1266,8 @@ int main() {
     padInput.driveSens = cfg.padDriveSens;  // stick feel from Tanks.json
     padInput.aimSens = cfg.padAimSens;
     NavGrid navGrid;           // A* grid; entities use it when pathEnabled
+    Vector3 noisePos = { 0, 0, 0 };  // last player shot (walkers hear it)
+    float noiseAge = 1e9f;
     InputState in;              // refreshed at the top of every frame
     Vector2 droneCursor = { screenWidth / 2.0f, screenHeight / 2.0f };
     // Setup phase starts in drone mode so the player can survey the map
@@ -1406,6 +1450,9 @@ int main() {
                                 cfg.pathCellSize);
             g.nav = &navGrid;
         }
+        noiseAge += dt;
+        g.noisePos = noisePos;
+        g.noiseAge = noiseAge;
         tank.update(dt, in, g, mode == CamMode::GUNNER && tank.hp > 0);
         ResolveWreckCollisions(tank.pos, enemies, cfg.wreckBlocks);
 
@@ -1419,6 +1466,11 @@ int main() {
             FireShell(tank, shells, cfg);
             fireCooldown = cfg.shellCooldown;
             shotsFired++;
+            // Gunfire is noise: unaware walkers in earshot investigate.
+            noisePos = tank.pos;
+            noiseAge = 0.0f;
+            g.noisePos = noisePos;
+            g.noiseAge = 0.0f;
             Vector3 muzzle = MuzzleWorldPos(tank);
             // Compact bright burst at the muzzle tip (not a beach ball).
             flashes.push_back(Flash{ muzzle, 0.22f, 0.22f, 0.9f });
@@ -1772,7 +1824,7 @@ int main() {
         }
 
         BeginDrawing();
-        ClearBackground(SKYBLUE);
+        ClearBackground(NightOn(cfg) ? Color{ 13, 16, 28, 255 } : SKYBLUE);
 
         if (inReplay) {
             const ReplayFrame *fr = SampleReplay(replayBuf, replayNow);
@@ -1792,11 +1844,11 @@ int main() {
 
         BeginMode3D(camera);
         // Ground with ditch pits, street grid, bridges, towers.
-        DrawGround(ditches);
-        DrawGrid(40, 20.0f);
-        DrawBridges(bridges);
-        DrawVillage(village);
-        DrawTowers(towers, frameCount);
+        DrawGround(ditches, cfg);
+        DrawSceneGrid(cfg);
+        DrawBridges(bridges, cfg);
+        DrawVillage(village, cfg);
+        DrawTowers(towers, frameCount, cfg);
         tank.draw(mode == CamMode::GUNNER);
         // Enemies are hidden until combat begins, and by fog of war.
         if (phase == Phase::COMBAT) DrawEnemies(enemies, cfg);

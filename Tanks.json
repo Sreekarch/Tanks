@@ -72,6 +72,21 @@
     "repathSeconds": 0.75,
     "drawPaths": false
   },
+  "stealth": {
+    "enabled": true,
+    "nightMode": true,
+    "visionRange": 55.0,
+    "visionHalfAngleDegrees": 35.0,
+    "detectSeconds": 1.1,
+    "forgetSeconds": 2.5,
+    "alarmSeconds": 0.9,
+    "alarmRadius": 60.0,
+    "noiseRadius": 55.0,
+    "memorySeconds": 4.0,
+    "searchSeconds": 3.5,
+    "patrolSpeedFactor": 0.55,
+    "patrolPauseSeconds": 1.6
+  },
   "fog": {
     "enabled": true,
     "sightRadius": 90.0,

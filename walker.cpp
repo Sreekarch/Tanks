@@ -82,6 +82,13 @@ void Tripedal::update(float dt, GameCtx &g) {
 
     const PlayerTank &player = g.player;
     const Config &cfg = g.cfg;
+
+    if (!stateInit) {
+        stateInit = true;
+        sweepSeed = (float)GetRandomValue(0, 628) * 0.01f;
+        if (cfg.stealthEnabled) aiState = AIState::PATROL;
+    }
+
     float dx = player.pos.x - pos.x, dz = player.pos.z - pos.z;
     float dist = sqrtf(dx * dx + dz * dz);
     // Tripedals aim the gun pod in elevation at the player's hull so the
@@ -92,27 +99,177 @@ void Tripedal::update(float dt, GameCtx &g) {
     bool los = !LosBlocked(eye, tgt, g.village);
     bool inRange = dist < cfg.enemyRange;
 
-    switch (aiState) {
-    case AIState::ADVANCE: {
-        float want = atan2f(dx, -dz);
-        float throttleScale = (los && inRange && dist < cfg.enemyRange * 0.7f) ? 0.0f : 1.0f;
-        if (throttleScale > 0.0f) {
-            // Pathfinding (if enabled): follow the A* route to the
-            // player; otherwise steer straight at them.
-            float steer = want;
-            if (g.nav) {
-                float a;
-                if (navPath.steer(*g.nav, pos, player.pos, dt,
-                                  cfg.pathRepathSeconds, a)) steer = a;
+    // --- Perception: with stealth on, the walker only knows what its
+    // searchlight cone sees; the detection meter gates the alarm. ---
+    float headYaw = hullAngle + turretAngle;
+    float angTo = atan2f(dx, -dz);
+    bool inCone = fabsf(NormalizeAngle(angTo - headYaw)) <
+                  cfg.visionHalfAngleDeg * (float)DEG2RAD;
+    bool seeing = cfg.stealthEnabled
+        ? (los && dist < cfg.visionRange && inCone)
+        : los;
+    bool engaged = aiState == AIState::ADVANCE || aiState == AIState::SHOOT ||
+                   aiState == AIState::SEEK_COVER || aiState == AIState::COVER_WAIT;
+    if (!cfg.stealthEnabled) {
+        lastSeenPos = player.pos;  // legacy omniscience
+        lastSeenAgo = 0.0f;
+    } else if (seeing) {
+        lastSeenPos = player.pos;
+        lastSeenAgo = 0.0f;
+        if (!engaged && aiState != AIState::ALARM && aiState != AIState::STAGGER) {
+            float prox = Clamp(1.6f - dist / cfg.visionRange, 0.5f, 1.5f);
+            detect += dt * prox / cfg.detectSeconds;
+            if (detect > 0.35f && aiState == AIState::PATROL) {
+                stimulusPos = player.pos;  // a glimpse: go and look
+                aiState = AIState::INVESTIGATE;
+                searchPhase = false;
+                aiTimer = 0.0f;
             }
-            driveToward(steer, cfg.enemySpeed, g);
         }
+    } else {
+        lastSeenAgo += dt;
+        if (!engaged && aiState != AIState::ALARM)
+            detect = fmaxf(0.0f, detect - dt / cfg.forgetSeconds);
+    }
+    detect = Clamp(detect, 0.0f, 1.0f);
+    if (cfg.stealthEnabled && seeing && detect >= 1.0f && !engaged &&
+        aiState != AIState::ALARM && aiState != AIState::STAGGER) {
+        // Spotted: raise the alarm (the call is the telegraph; nearby
+        // walkers are pulled in when it completes).
+        aiState = AIState::ALARM;
+        aiTimer = 0.0f;
+        alarmT = 0.0f;
+    }
+
+    // Fresh gunfire pulls unaware walkers toward the sound.
+    if (cfg.stealthEnabled && g.noiseAge < 0.05f && !engaged &&
+        aiState != AIState::ALARM && aiState != AIState::STAGGER) {
+        float ndx = g.noisePos.x - pos.x, ndz = g.noisePos.z - pos.z;
+        if (ndx * ndx + ndz * ndz < cfg.noiseRadius * cfg.noiseRadius) {
+            stimulusPos = g.noisePos;
+            aiState = AIState::INVESTIGATE;
+            searchPhase = false;
+            aiTimer = 0.0f;
+        }
+    }
+
+    // Where the walker believes the player is (live while seen).
+    Vector3 goalPos = seeing ? player.pos : lastSeenPos;
+    float gdx = goalPos.x - pos.x, gdz = goalPos.z - pos.z;
+    float goalDist = sqrtf(gdx * gdx + gdz * gdz);
+
+    // Steer along the nav path (or straight) toward a ground goal.
+    auto moveTo = [&](const Vector3 &goal, float speed) {
+        float steer = atan2f(goal.x - pos.x, -(goal.z - pos.z));
+        if (g.nav) {
+            float a;
+            if (navPath.steer(*g.nav, pos, goal, dt,
+                              cfg.pathRepathSeconds, a)) steer = a;
+        }
+        driveToward(steer, speed, g);
+    };
+    // Searchlight/head sweep while unaware.
+    auto sweepHead = [&](float arc, float speed) {
+        float target = sinf((float)GetTime() * speed + sweepSeed) * arc;
+        float diff = NormalizeAngle(target - turretAngle);
+        turretAngle += Clamp(diff * 3.0f, -2.2f, 2.2f) * dt;
+    };
+
+    switch (aiState) {
+    case AIState::PATROL: {
+        sweepHead(0.65f, 0.9f);
+        if (patrolPauseT > 0.0f) {
+            patrolPauseT -= dt;
+            break;
+        }
+        if (!hasPatrolGoal) {
+            // Auto-pick a patrol point worth walking to (not in a pit,
+            // not inside a building).
+            for (int tries = 0; tries < 8; ++tries) {
+                Vector3 cand = {
+                    (float)GetRandomValue(-(int)ARENA_HALF + 25, (int)ARENA_HALF - 25),
+                    0.0f,
+                    (float)GetRandomValue(-(int)ARENA_HALF + 25, (int)ARENA_HALF - 25) };
+                float pdx = cand.x - pos.x, pdz = cand.z - pos.z;
+                if (pdx * pdx + pdz * pdz < 60.0f * 60.0f) continue;
+                bool bad = DitchDepthAt(cand.x, cand.z, g.ditches, g.bridges) > 0.0f;
+                for (const auto &b : g.village) {
+                    if (b.destroyed) continue;
+                    if (fabsf(cand.x - b.center.x) < b.size.x * 0.5f + 3.0f &&
+                        fabsf(cand.z - b.center.z) < b.size.z * 0.5f + 3.0f) { bad = true; break; }
+                }
+                patrolGoal = cand;
+                hasPatrolGoal = true;
+                if (!bad) break;
+            }
+        }
+        if (hasPatrolGoal) {
+            moveTo(patrolGoal, cfg.enemySpeed * cfg.patrolSpeedFactor);
+            float pdx = patrolGoal.x - pos.x, pdz = patrolGoal.z - pos.z;
+            if (pdx * pdx + pdz * pdz < 9.0f) {
+                hasPatrolGoal = false;
+                patrolPauseT = cfg.patrolPauseSeconds;  // stop and sweep
+            }
+        }
+        break;
+    }
+    case AIState::INVESTIGATE: {
+        if (!searchPhase) {
+            sweepHead(0.3f, 1.2f);
+            moveTo(stimulusPos, cfg.enemySpeed * 0.85f);
+            float sdx = stimulusPos.x - pos.x, sdz = stimulusPos.z - pos.z;
+            if (sdx * sdx + sdz * sdz < 12.25f) { searchPhase = true; aiTimer = 0.0f; }
+        } else {
+            sweepHead(1.0f, 1.5f);  // look around the stimulus point
+            if (aiTimer >= cfg.searchSeconds) {
+                aiState = AIState::PATROL;
+                aiTimer = 0.0f;
+                hasPatrolGoal = false;
+            }
+        }
+        break;
+    }
+    case AIState::ALARM: {
+        // Head snaps to the player and calls out; the broadcast lands
+        // when the call completes (kill or break it first to stay hidden).
+        float wantTurret = NormalizeAngle(atan2f(dx, -dz) - hullAngle);
+        float tdiff = NormalizeAngle(wantTurret - turretAngle);
+        turretAngle += Clamp(tdiff * 5.0f, -3.0f, 3.0f) * dt;
+        alarmT += dt;
+        if (alarmT >= cfg.alarmSeconds) {
+            for (auto &w : g.walkers) {
+                if (w.get() == this || !w->alive) continue;
+                float ddx = w->pos.x - pos.x, ddz = w->pos.z - pos.z;
+                if (ddx * ddx + ddz * ddz > cfg.alarmRadius * cfg.alarmRadius) continue;
+                if (w->aiState == AIState::PATROL ||
+                    w->aiState == AIState::INVESTIGATE ||
+                    w->aiState == AIState::SEARCH) {
+                    w->lastSeenPos = lastSeenPos;
+                    w->lastSeenAgo = 0.0f;
+                    w->aiState = AIState::ADVANCE;
+                    w->aiTimer = 0.0f;
+                }
+            }
+            aiState = AIState::ADVANCE;
+            aiTimer = 0.0f;
+        }
+        break;
+    }
+    case AIState::ADVANCE: {
+        // Engaged: hunt the live position while seen, else the last
+        // known one; losing the trail drops to SEARCH.
+        bool stopHere = seeing && inRange && dist < cfg.enemyRange * 0.7f;
+        if (!stopHere) moveTo(goalPos, cfg.enemySpeed);
         // Turret relaxes toward hull-forward when not engaged.
         turretAngle = NormalizeAngle(turretAngle - turretAngle * fminf(dt * 2.0f, 1.0f));
-        if (los && inRange) {
+        if (seeing && inRange) {
             aiState = AIState::SHOOT;
             aiTimer = 0.0f;
             aimTimer = 0.0f;
+        } else if (!seeing && (goalDist < 3.5f || lastSeenAgo > cfg.memorySeconds)) {
+            aiState = AIState::SEARCH;
+            searchPhase = false;
+            aiTimer = 0.0f;
         }
         break;
     }
@@ -143,6 +300,23 @@ void Tripedal::update(float dt, GameCtx &g) {
             aimTimer = 0.0f;  // lost the lock
             aiState = AIState::ADVANCE;
             aiTimer = 0.0f;
+        }
+        break;
+    }
+    case AIState::SEARCH: {
+        if (!searchPhase) {
+            sweepHead(0.3f, 1.2f);
+            moveTo(lastSeenPos, cfg.enemySpeed * 0.85f);
+            float sdx = lastSeenPos.x - pos.x, sdz = lastSeenPos.z - pos.z;
+            if (sdx * sdx + sdz * sdz < 12.25f) { searchPhase = true; aiTimer = 0.0f; }
+        } else {
+            sweepHead(1.1f, 1.3f);  // sweep the area where it lost you
+            if (aiTimer >= cfg.searchSeconds) {
+                aiState = AIState::PATROL;
+                aiTimer = 0.0f;
+                hasPatrolGoal = false;
+                detect = 0.0f;
+            }
         }
         break;
     }
@@ -180,9 +354,16 @@ void Tripedal::update(float dt, GameCtx &g) {
         walkPhase += cfg.staggerStepSpeed * dt * dm * 2.0f;  // hurried steps
         ResolveBuildingCollisions(pos, g.village);
         if (staggerT <= 0.0f) {
-            // Footing regained: break off and seek cover behind a building.
-            coverPos = PickCover(*this, player.pos, g.village);
-            aiState = AIState::SEEK_COVER;
+            if (cfg.stealthEnabled && !staggerWasEngaged) {
+                // Shot while unaware: turn toward where the shot came
+                // from and go find out — no alarm until it sees you.
+                aiState = AIState::INVESTIGATE;
+                searchPhase = false;
+            } else {
+                // Footing regained: break off and seek cover.
+                coverPos = PickCover(*this, player.pos, g.village);
+                aiState = AIState::SEEK_COVER;
+            }
             aiTimer = 0.0f;
             aimTimer = 0.0f;
         }
@@ -205,6 +386,13 @@ void Walker::damage(GameCtx &g, const Vector3 &hitDir) {
         float hl = sqrtf(hitDir.x * hitDir.x + hitDir.z * hitDir.z);
         staggerDir = (hl > 0.001f) ? Vector3{ hitDir.x / hl, 0.0f, hitDir.z / hl }
                                    : Vector3{ 0.0f, 0.0f, 0.0f };
+        // Stealth: remember whether it was already fighting, and where
+        // the shot came from (it must look there and find the shooter
+        // itself before it can raise any alarm).
+        staggerWasEngaged = (aiState == AIState::ADVANCE || aiState == AIState::SHOOT ||
+                             aiState == AIState::SEEK_COVER || aiState == AIState::COVER_WAIT);
+        stimulusPos = { pos.x - staggerDir.x * 45.0f, 0.0f,
+                        pos.z - staggerDir.z * 45.0f };
         float hy = hullAngle + turretAngle;
         // Skyward crane: shots come from below, so the head rears up hard.
         swayPitchAmp = 0.85f;
@@ -438,6 +626,49 @@ void Tripedal::draw(float alpha, const Config &cfg) const {
     else drawWreck();
     if (cfg.pathDrawPaths && alive)
         navPath.draw(pos, Color{ 255, 160, 60, 220 });  // orange route
+    // Searchlight: the vision cone rendered as a real beam of light —
+    // layered fan with distance falloff, a bright core, and a lamp glow
+    // at the head. Pale while calm, yellowing as the spotting meter
+    // fills, red during the alarm call.
+    if (cfg.stealthEnabled && alive &&
+        (aiState == AIState::PATROL || aiState == AIState::INVESTIGATE ||
+         aiState == AIState::SEARCH || aiState == AIState::ALARM)) {
+        float yaw = hullAngle + turretAngle;
+        float half = cfg.visionHalfAngleDeg * (float)DEG2RAD;
+        unsigned char cr, cg, cb;
+        if (aiState == AIState::ALARM)      { cr = 255; cg = 70;  cb = 45;  }
+        else if (detect > 0.75f)            { cr = 255; cg = 120; cb = 60;  }
+        else {  // pale blue-white warming toward yellow as the meter fills
+            cr = (unsigned char)(205 + 50 * detect);
+            cg = (unsigned char)(228 - 28 * detect);
+            cb = (unsigned char)(255 - 165 * detect);
+        }
+        // One band of the beam between two range fractions.
+        auto band = [&](float r0f, float r1f, float halfAngle, unsigned char a) {
+            Color cc{ cr, cg, cb, (unsigned char)(a * alpha) };
+            const int segs = 14;
+            for (int i = 0; i < segs; ++i) {
+                float a0 = yaw - halfAngle + 2.0f * halfAngle * (float)i / segs;
+                float a1 = yaw - halfAngle + 2.0f * halfAngle * (float)(i + 1) / segs;
+                float R = cfg.visionRange;
+                Vector3 A = { pos.x + sinf(a0) * R * r0f, 0.25f, pos.z - cosf(a0) * R * r0f };
+                Vector3 B = { pos.x + sinf(a1) * R * r0f, 0.25f, pos.z - cosf(a1) * R * r0f };
+                Vector3 C = { pos.x + sinf(a0) * R * r1f, 0.25f, pos.z - cosf(a0) * R * r1f };
+                Vector3 D = { pos.x + sinf(a1) * R * r1f, 0.25f, pos.z - cosf(a1) * R * r1f };
+                DrawTriangle3D(A, D, C, cc);
+                DrawTriangle3D(A, B, D, cc);
+            }
+        };
+        band(0.0f, 0.4f, half, 150);        // bright near the lamp
+        band(0.4f, 0.75f, half, 80);
+        band(0.75f, 1.0f, half, 38);       // fading edge
+        band(0.0f, 1.0f, half * 0.5f, 55); // hot core down the middle
+        // Lamp glow at the head (halo + bright core).
+        float fx = sinf(yaw), fz = -cosf(yaw);
+        Vector3 lamp = { pos.x + fx * 1.4f, WALKER_NECK_Y + 0.55f, pos.z + fz * 1.4f };
+        DrawSphere(lamp, 0.95f, Color{ cr, cg, cb, (unsigned char)(45 * alpha) });
+        DrawSphere(lamp, 0.42f, Color{ 255, 246, 220, 255 });
+    }
 }
 
 std::vector<std::unique_ptr<Walker>> SpawnEnemies(int count, int hits,

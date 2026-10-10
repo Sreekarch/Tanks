@@ -117,6 +117,20 @@ struct Config {
     float pathCellSize     = 2.0f;   // nav grid resolution (world units)
     float pathRepathSeconds = 0.75f; // max time between re-plans per entity
     bool  pathDrawPaths    = false;  // debug: draw active paths in-world
+    // Alien perception & patrol (stealth); off = legacy omniscient rush
+    bool  stealthEnabled   = true;
+    bool  nightMode        = true;   // dark scene so searchlights read as light
+    float visionRange      = 55.0f;  // searchlight cone length
+    float visionHalfAngleDeg = 35.0f; // searchlight cone half-angle
+    float detectSeconds    = 1.1f;   // in-cone time to full alert (closer = faster)
+    float forgetSeconds    = 2.5f;   // detection meter drain time
+    float alarmSeconds     = 0.9f;   // alarm-call animation before broadcast
+    float alarmRadius      = 60.0f;  // who hears a raised alarm
+    float noiseRadius      = 55.0f;  // who hears a player shot
+    float memorySeconds    = 4.0f;   // LOS memory before giving up to SEARCH
+    float searchSeconds    = 3.5f;   // look-around time (investigate/search)
+    float patrolSpeedFactor = 0.55f; // patrol pace vs combat speed
+    float patrolPauseSeconds = 1.6f; // stop-and-sweep at each patrol point
 };
 
 Config LoadConfig();
@@ -124,7 +138,8 @@ Config LoadConfig();
 // Shared enums.
 enum class WalkerKind { TRIPEDAL, CRAB, BIPED };
 
-enum class AIState { ADVANCE, SHOOT, SEEK_COVER, COVER_WAIT, STAGGER };
+enum class AIState { ADVANCE, SHOOT, SEEK_COVER, COVER_WAIT, STAGGER,
+                     PATROL, INVESTIGATE, ALARM, SEARCH };
 
 enum class AllyOrder { FOLLOW, MOVE, HOLD, ATTACK };
 
@@ -273,6 +288,8 @@ struct GameCtx {
     bool inCombat = false;
     float dt = 0.0f;
     NavGrid *nav = nullptr;  // pathfinding grid (pathfind.h); null = direct steering
+    Vector3 noisePos = { 0, 0, 0 };  // last player shot position
+    float noiseAge = 1e9f;           // seconds since that shot
 };
 
 // Cross-file helpers (defined in tankshooter.cpp).

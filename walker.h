@@ -41,6 +41,19 @@ public:
     Vector3 coverPos = { 0, 0, 0 };
     float fireTimer = 0.0f;     // time since last shot
     float aimTimer = 0.0f;      // lock-on tracking time (telegraph)
+    // Perception & patrol (stealth): the walker only knows what it sees.
+    bool stateInit = false;     // first-update setup (patrol vs legacy rush)
+    float detect = 0.0f;        // 0..1 spotting meter (fills in the cone)
+    Vector3 lastSeenPos = { 0, 0, 0 };  // last known player position
+    float lastSeenAgo = 1e9f;   // seconds since line of sight
+    Vector3 stimulusPos = { 0, 0, 0 };  // noise/glimpse/shot point to check out
+    Vector3 patrolGoal = { 0, 0, 0 };
+    bool hasPatrolGoal = false;
+    float patrolPauseT = 0.0f;  // stop-and-sweep timer at a patrol point
+    float sweepSeed = 0.0f;     // per-walker searchlight sweep phase
+    bool searchPhase = false;   // INVESTIGATE/SEARCH: arrived, looking around
+    float alarmT = 0.0f;        // ALARM animation timer
+    bool staggerWasEngaged = false;  // shot while in combat (vs unaware)
     // Death animation state.
     float deathT = 0.0f;
     Vector3 turretPos;        // detached turret world position

@@ -622,7 +622,10 @@ void Tripedal::drawWreck() const {
 }
 
 void Tripedal::draw(float alpha, const Config &cfg) const {
-    if (alive) drawWalker(cfg, alpha);
+    if (alive) {
+        DrawBlobShadow(pos, 3.6f, 110);
+        drawWalker(cfg, alpha);
+    }
     else drawWreck();
     if (cfg.pathDrawPaths && alive)
         navPath.draw(pos, Color{ 255, 160, 60, 220 });  // orange route

@@ -90,6 +90,13 @@ Config LoadConfig() {
         auto gp = j.value("gamepad", nlohmann::json::object());
         c.padDriveSens   = gp.value("driveSensitivity", c.padDriveSens);
         c.padAimSens     = gp.value("aimSensitivity", c.padAimSens);
+        auto dp = j.value("display", nlohmann::json::object());
+        c.windowWidth  = dp.value("windowWidth", c.windowWidth);
+        c.windowHeight = dp.value("windowHeight", c.windowHeight);
+        c.fullscreen   = dp.value("fullscreen", c.fullscreen);
+        c.msaa4x       = dp.value("msaa4x", c.msaa4x);
+        c.insetScale   = dp.value("insetScale", c.insetScale);
+        c.showFps      = dp.value("showFps", c.showFps);
         auto pf = j.value("pathfinding", nlohmann::json::object());
         c.pathEnabled    = pf.value("enabled", c.pathEnabled);
         c.pathCellSize   = pf.value("cellSize", c.pathCellSize);
@@ -336,7 +343,7 @@ static std::vector<Building> BuildVillage(int hitsToDestroy, int seed) {
 // plus ditch pit walls/floors.
 // Night ops: with stealth on, the scene drops to dusk so searchlights
 // (and muzzle flashes, tower beacons) read as actual light sources.
-static bool NightOn(const Config &cfg) { return cfg.stealthEnabled && cfg.nightMode; }
+static bool NightOn(const Config &cfg) { return cfg.nightActive(); }
 
 // Ground reference grid: raylib's DrawGrid by day; at night a faint
 // arena-bounded grid so lines don't float out into the dark.
@@ -411,6 +418,7 @@ static void DrawTowers(const std::vector<Tower> &towers, int frameCount, const C
         }
         Color concrete = t.hitFlashT > 0.0f ? WHITE : DimColor(Color{ 130, 130, 135, 255 }, dim);
         Color dark = t.hitFlashT > 0.0f ? WHITE : DimColor(Color{ 70, 70, 78, 255 }, dim);
+        DrawBlobShadow(t.pos, 4.4f, 100);
         DrawCylinder(Vector3{ t.pos.x, 0.0f, t.pos.z }, 3.0f, 3.6f, 4.0f, 10, concrete);
         DrawCylinder(Vector3{ t.pos.x, 4.0f, t.pos.z }, 2.2f, 2.6f, 1.0f, 10, dark);
         rlPushMatrix();
@@ -427,6 +435,60 @@ static void DrawTowers(const std::vector<Tower> &towers, int frameCount, const C
             DrawCube(Vector3{ t.pos.x - 2.0f + i * 1.2f, 7.2f, t.pos.z }, 0.9f, 0.9f, 0.9f,
                      i < t.hp ? GREEN : DARKGRAY);
     }
+}
+
+// Building windows: dark glass by day; at night a share of them glow
+// warm, which sells the dark and gives the village depth after dark.
+static void DrawBuildingWindows(const Building &b, bool night) {
+    int base = (int)(fabsf(b.center.x) * 31.0f + fabsf(b.center.z) * 57.0f)
+             + (int)b.size.y * 13;
+    auto hash01 = [](int i) {
+        float h = sinf((float)i * 127.1f + 311.7f) * 43758.5453f;
+        return h - floorf(h);
+    };
+    int rows = (int)(b.size.y / 4.5f); if (rows < 1) rows = 1;
+    int colsX = (int)(b.size.x / 5.5f); if (colsX < 1) colsX = 1;
+    int colsZ = (int)(b.size.z / 5.5f); if (colsZ < 1) colsZ = 1;
+    int slot = 0;
+    auto win = [&](Vector3 p, float w, float d) {
+        bool lit = night && hash01(base + slot++) < 0.45f;
+        Color c = lit ? Color{ 255, 199, 110, 255 } : Color{ 22, 26, 34, 255 };
+        DrawCube(p, w, 1.7f, d, c);
+    };
+    for (int r = 0; r < rows; ++r) {
+        float y = 2.6f + r * 4.2f;
+        if (y > b.size.y - 1.2f) break;
+        for (int ci = 0; ci < colsX; ++ci) {
+            float x = (colsX == 1) ? b.center.x
+                      : b.center.x - b.size.x * 0.5f + (ci + 0.5f) * (b.size.x / colsX);
+            win(Vector3{ x, y, b.center.z + b.size.z * 0.5f + 0.07f }, 1.3f, 0.14f);
+            win(Vector3{ x, y, b.center.z - b.size.z * 0.5f - 0.07f }, 1.3f, 0.14f);
+        }
+        for (int ci = 0; ci < colsZ; ++ci) {
+            float z = (colsZ == 1) ? b.center.z
+                      : b.center.z - b.size.z * 0.5f + (ci + 0.5f) * (b.size.z / colsZ);
+            win(Vector3{ b.center.x + b.size.x * 0.5f + 0.07f, y, z }, 0.14f, 1.3f);
+            win(Vector3{ b.center.x - b.size.x * 0.5f - 0.07f, y, z }, 0.14f, 1.3f);
+        }
+    }
+}
+
+// Night sky: a fixed dome of stars (deterministic, generated once).
+static void DrawStars(const Config &cfg) {
+    if (!NightOn(cfg)) return;
+    static Vector3 pts[240];
+    static bool ready = false;
+    if (!ready) {
+        ready = true;
+        for (int i = 0; i < 240; ++i) {
+            float a = (float)GetRandomValue(0, 6283) * 0.001f;
+            float y = 0.15f + (float)GetRandomValue(0, 850) * 0.001f;
+            float r = sqrtf(fmaxf(0.0f, 1.0f - y * y));
+            pts[i] = Vector3{ cosf(a) * r * 640.0f, y * 640.0f, sinf(a) * r * 640.0f };
+        }
+    }
+    for (const auto &p : pts)
+        DrawPoint3D(p, Color{ 205, 215, 235, 200 });
 }
 
 static void DrawVillage(const std::vector<Building> &village, const Config &cfg) {
@@ -462,11 +524,12 @@ static void DrawVillage(const std::vector<Building> &village, const Config &cfg)
         Color c = Color{ (unsigned char)(b.color.r * f * dim), (unsigned char)(b.color.g * f * dim),
                          (unsigned char)(b.color.b * f * dim), 255 };
         DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
+        DrawBuildingWindows(b, NightOn(cfg));
         DrawCubeWires(b.center, b.size.x, b.size.y, b.size.z, Color{ 0, 0, 0, 60 });
         // Darker "roof" cap so buildings read as 3D from the drone.
         DrawCube(Vector3{ b.center.x, b.size.y + 0.05f, b.center.z },
                  b.size.x * 0.98f, 0.1f, b.size.z * 0.98f,
-                 Color{ 70, 62, 55, 255 });
+                 DimColor(Color{ 70, 62, 55, 255 }, dim));
         // Persistent scorch marks where shells struck.
         rlDisableBackfaceCulling();
         for (const auto &m : b.marks) DrawHitMark(m);
@@ -964,10 +1027,11 @@ static void DrawReplayBuildings(const std::vector<Building> &village,
         Color c = Color{ (unsigned char)(b.color.r * f), (unsigned char)(b.color.g * f),
                          (unsigned char)(b.color.b * f), 255 };
         DrawCube(b.center, b.size.x, b.size.y, b.size.z, c);
+        DrawBuildingWindows(b, dimFactor < 1.0f);  // dimFactor<1 only at night
         DrawCubeWires(b.center, b.size.x, b.size.y, b.size.z, Color{ 0, 0, 0, 60 });
         DrawCube(Vector3{ b.center.x, b.size.y + 0.05f, b.center.z },
                  b.size.x * 0.98f, 0.1f, b.size.z * 0.98f,
-                 Color{ 70, 62, 55, 255 });
+                 DimColor(Color{ 70, 62, 55, 255 }, dimFactor));
     }
 }
 
@@ -1025,6 +1089,7 @@ static void DrawReplay(const ReplayFrame &f,
 
     BeginMode3D(rc);
     DrawGround(ditches, cfg);
+    DrawStars(cfg);
     DrawSceneGrid(cfg);
     DrawBridges(bridges, cfg);
     DrawReplayBuildings(village, f.buildings, NightOn(cfg) ? 0.4f : 1.0f);
@@ -1148,8 +1213,12 @@ static void DrawMinimap(RenderTexture2D target, const PlayerTank &tank,
     EndTextureMode();
 
     int mx = screenWidth - S - 16, my = screenHeight - S - 16;
-    DrawTextureRec(target.texture, Rectangle{ 0.0f, 0.0f, (float)S, -(float)S },
-                   Vector2{ (float)mx, (float)my }, WHITE);
+    // Rendered at insetScale and downscaled here for sharper lines.
+    DrawTexturePro(target.texture,
+                   Rectangle{ 0.0f, 0.0f, (float)(S * cfg.insetScale),
+                              (float)(-S * cfg.insetScale) },
+                   Rectangle{ (float)mx, (float)my, (float)S, (float)S },
+                   Vector2{ 0.0f, 0.0f }, 0.0f, WHITE);
     DrawRectangleLines(mx, my, S, S, WHITE);
     DrawText("MAP", mx + 8, my + 6, 16, WHITE);
 }
@@ -1186,6 +1255,7 @@ static void DrawChaseView(RenderTexture2D target, const PlayerTank &tank,
     ClearBackground(NightOn(cfg) ? Color{ 13, 16, 28, 255 } : SKYBLUE);
     BeginMode3D(cc);
     DrawGround(ditches, cfg);
+    DrawStars(cfg);
     DrawSceneGrid(cfg);
     DrawBridges(bridges, cfg);
     DrawVillage(village, cfg);
@@ -1214,25 +1284,35 @@ static void DrawChaseView(RenderTexture2D target, const PlayerTank &tank,
     EndMode3D();
     EndTextureMode();
 
-    // Blit above the minimap, right-aligned.
-    int my = screenHeight - cfg.minimapSize - 16;  // minimap top edge
+    // Blit at the top-right corner.
     int cx = screenWidth - W - 16;
-    int cy = my - H - 12;
-    DrawTextureRec(target.texture, Rectangle{ 0.0f, 0.0f, (float)W, -(float)H },
-                   Vector2{ (float)cx, (float)cy }, WHITE);
+    int cy = 16;
+    DrawTexturePro(target.texture,
+                   Rectangle{ 0.0f, 0.0f, (float)(W * cfg.insetScale),
+                              (float)(-H * cfg.insetScale) },
+                   Rectangle{ (float)cx, (float)cy, (float)W, (float)H },
+                   Vector2{ 0.0f, 0.0f }, 0.0f, WHITE);
     DrawRectangleLines(cx, cy, W, H, WHITE);
     DrawText("DRONE", cx + 8, cy + 6, 16, WHITE);
 }
 
 int main() {
-    const int screenWidth = 1280, screenHeight = 720;
+    Config cfg = LoadConfig();
+    int screenWidth = cfg.windowWidth, screenHeight = cfg.windowHeight;
+    if (cfg.msaa4x) SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(screenWidth, screenHeight, "Tankshooter v0.6");
+    if (cfg.fullscreen) {
+        ToggleFullscreen();
+        screenWidth = GetScreenWidth();
+        screenHeight = GetScreenHeight();
+    }
     SetTargetFPS(60);
     // Cursor starts enabled: the game opens in drone mode (setup phase).
 
-    Config cfg = LoadConfig();
-    RenderTexture2D minimapTarget = LoadRenderTexture(cfg.minimapSize, cfg.minimapSize);
-    RenderTexture2D chaseTarget = LoadRenderTexture(cfg.chaseWidth, cfg.chaseHeight);
+    RenderTexture2D minimapTarget = LoadRenderTexture(
+        cfg.minimapSize * cfg.insetScale, cfg.minimapSize * cfg.insetScale);
+    RenderTexture2D chaseTarget = LoadRenderTexture(
+        cfg.chaseWidth * cfg.insetScale, cfg.chaseHeight * cfg.insetScale);
     // Fog-of-war puffs: one soft radial sprite, instanced as camera-facing
     // billboards over fogged ground.
     Texture2D fogPuffTex = MakeFogPuffTexture();
@@ -1845,6 +1925,7 @@ int main() {
         BeginMode3D(camera);
         // Ground with ditch pits, street grid, bridges, towers.
         DrawGround(ditches, cfg);
+        DrawStars(cfg);
         DrawSceneGrid(cfg);
         DrawBridges(bridges, cfg);
         DrawVillage(village, cfg);
@@ -1915,8 +1996,21 @@ int main() {
         // HUD
         const char *modeName = (mode == CamMode::GUNNER) ? "GUNNER" : "DRONE";
         DrawText(TextFormat("[%s]  TAB to switch", modeName), 16, 12, 22, DARKGRAY);
-        DrawText(TextFormat("Map: %s", maps[mapIdx].name.c_str()),
-                 screenWidth - 360, 12, 20, DARKGRAY);
+        // Right-side info stack under the drone view: map name, then FPS.
+        {
+            int infoY = 12;
+            if (mode == CamMode::GUNNER && cfg.chaseEnabled)
+                infoY = 16 + cfg.chaseHeight + 8;
+            Color infoCol = cfg.nightActive() ? Color{ 220, 224, 235, 255 } : DARKGRAY;
+            const char *mapLabel = TextFormat("Map: %s", maps[mapIdx].name.c_str());
+            DrawText(mapLabel, screenWidth - 16 - MeasureText(mapLabel, 20),
+                     infoY, 20, infoCol);
+            if (cfg.showFps) {
+                const char *fpsLabel = TextFormat("FPS: %d", GetFPS());
+                DrawText(fpsLabel, screenWidth - 16 - MeasureText(fpsLabel, 20),
+                         infoY + 24, 20, infoCol);
+            }
+        }
         if (mode == CamMode::GUNNER){
             // D-pad cross: WASD + arrow labels on the arms (drive controls).
             int dx = 16, dy = 36, s = 34;
@@ -2165,7 +2259,6 @@ int main() {
             DrawCircleV(compC, 4, YELLOW);
             DrawText("TURRET", (int)compC.x - 26, (int)compC.y + 44, 14, DARKGRAY);
         } 
-        DrawFPS(screenWidth - 90, 12);
         if (const char *padName = padInput.activeName()) {
             DrawText(TextFormat("Gamepad: %s", padName), 12, screenHeight - 24, 14, GRAY);
         }

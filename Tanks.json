@@ -51,14 +51,14 @@
     "speed": 70.0
   },
   "minimap": {
-    "enabled": true,
+    "enabled": false,
     "size": 240,
     "height": 150.0
   },
   "chaseView": {
     "enabled": true,
-    "width": 320,
-    "height": 180,
+    "width": 480,
+    "height": 320,
     "camHeight": 26.0,
     "camDistance": 30.0
   },
@@ -86,6 +86,14 @@
     "searchSeconds": 3.5,
     "patrolSpeedFactor": 0.55,
     "patrolPauseSeconds": 1.6
+  },
+  "display": {
+    "windowWidth": 1600,
+    "windowHeight": 1200,
+    "fullscreen": false,
+    "msaa4x": true,
+    "insetScale": 2,
+    "showFps": true
   },
   "fog": {
     "enabled": true,

@@ -154,6 +154,7 @@ void PlayerTank::update(float dt, const InputState &in, const GameCtx &g, bool a
 
 void PlayerTank::draw(bool gunnerView) const {
     static const Color PLAYER_ARMOR = { 74, 94, 62, 255 };
+    if (!gunnerView) DrawBlobShadow(pos, 3.4f, 100);
     DrawTankHull(pos, hullAngle, PLAYER_ARMOR);
     Vector3 tc = { pos.x, 2.25f, pos.z };
     float ta = hullAngle + turretAngle;
@@ -326,6 +327,7 @@ void AlliedTank::draw(const Config &cfg, bool isSelected,
     if (alive) {
         Color armor = cfg.allyColor;
         if (hitFlashT > 0.0f) armor = Color{ 255, 240, 230, 255 };
+        DrawBlobShadow(pos, 3.4f, 100);
         DrawTankHull(pos, hullAngle, armor);
         DrawTankTurret(Vector3{ pos.x, 2.25f, pos.z },
                        hullAngle + turretAngle, armor);

@@ -131,6 +131,14 @@ struct Config {
     float searchSeconds    = 3.5f;   // look-around time (investigate/search)
     float patrolSpeedFactor = 0.55f; // patrol pace vs combat speed
     float patrolPauseSeconds = 1.6f; // stop-and-sweep at each patrol point
+    bool nightActive() const { return stealthEnabled && nightMode; }
+    // Display
+    int   windowWidth  = 1280;
+    int   windowHeight = 720;
+    bool  fullscreen   = false;
+    bool  msaa4x       = true;  // 4x anti-aliasing on the main view
+    int   insetScale   = 2;     // render scale for minimap/chase insets (sharper downscale)
+    bool  showFps      = true;  // FPS readout under the drone view
 };
 
 Config LoadConfig();
@@ -270,6 +278,15 @@ public:
     // tank faces (toward the village). Used at startup, on TAB, and on R.
     void reset(const PlayerTank &tank);
 };
+
+// Soft contact shadow that grounds a unit on the terrain.
+inline void DrawBlobShadow(Vector3 pos, float radius, unsigned char alpha) {
+    rlPushMatrix();
+    rlTranslatef(pos.x, 0.04f, pos.z);
+    rlScalef(1.0f, 0.05f, 1.0f);
+    DrawSphere(Vector3{ 0.0f, 0.0f, 0.0f }, radius, Color{ 0, 0, 0, alpha });
+    rlPopMatrix();
+}
 
 // Bundle of world references passed to entity updates.
 struct GameCtx {
